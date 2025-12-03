@@ -1,0 +1,23 @@
+[project]
+name = "daex"
+version = "0.1.0"
+description = "Wrapper utilities for scikit-SUNDAE to be used on JAX ecosysytem"
+readme = "README.md"
+authors = [
+    { name = "Akishika, Issui", email = "kshkss@users.noreply.github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "equinox>=0.13.2",
+    "jax>=0.8.1",
+    "jaxtyping>=0.3.3",
+    "scikit-sundae>=1.1.0",
+]
+
+[tool.pyright]
+venvPath = "."
+venv = ".venv"
+
+[build-system]
+requires = ["uv_build>=0.8.19,<0.9.0"]
+build-backend = "uv_build"
