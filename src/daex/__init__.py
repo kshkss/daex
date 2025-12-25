@@ -1,16 +1,14 @@
-from typing import Callable, Any, NamedTuple
+from typing import Callable, Any
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
 import numpy as np
 from jax.flatten_util import ravel_pytree
 from sksundae._cy_ida import IDA as _IDA
-from sksundae.ida import IDAResult
 import equinox as eqx
-from functools import partial
 from jaxtyping import Array, Float
 
-from daex.utils import HermiteInterpolation, HermiteSpline
+from daex.utils import HermiteSpline
 
 
 class IDA(eqx.Module):
