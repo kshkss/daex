@@ -113,13 +113,11 @@ class IDA(eqx.Module):
         ) -> tuple[jax.Array, None]:
             xarray = y[:x_size]
             yarray = yfunc(t)
-            yp_est = y[x_size : x_size + y_size]
-            zarray = y[x_size + y_size :]
-            zp_est = yp[x_size + y_size :]
+            zarray = y[x_size:]
+            zp_est = yp[x_size:]
             garray = const_fn(params, t, xarray, yarray)
-            yparray = deriv_fn(params, t, xarray, yarray)
             zparray = adjfn(params, t, xarray, yarray, zarray)
-            res = jnp.concatenate([garray, yp_est - yparray, zp_est - zparray])
+            res = jnp.concatenate([garray, zp_est - zparray])
             return res, None
 
         def resfn_wrapper(t, y, yp, res, userdata):
@@ -162,8 +160,7 @@ class IDA(eqx.Module):
 
         options_ad = options.copy()
         options_ad["jacfn"] = jacfn_adj_wrapper
-        options_ad["algebraic_idx"] = np.arange(x_size + y_size)
-        options_ad["calc_initcond"] = "yp0"
+        options_ad["algebraic_idx"] = np.arange(x_size)
 
         def _run_forward(params: Any, ts: jax.Array, y0: jax.Array, yp0: jax.Array):
             ida = _IDA(resfn_wrapper, userdata=params, **options)
@@ -318,14 +315,14 @@ class IDA(eqx.Module):
             z1 = wy - jsp.linalg.lu_solve(lu_dgdx, dgdy).T @ wx
             dz1 = dfdy - dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgdy)
             zp1 = -dz1.T @ z1
-            z1 = jnp.concatenate([x1, yp1, z1])
-            zp1 = jnp.concatenate([jnp.zeros_like(x1), jnp.zeros_like(yp1), zp1])
+            z1 = jnp.concatenate([x1, z1])
+            zp1 = jnp.concatenate([jnp.zeros_like(x1), zp1])
 
             z_type = jax.ShapeDtypeStruct([4] + list(z1.shape), z1.dtype)
             z = jax.pure_callback(
                 _run_adjoint, z_type, params, yfunc, ts[::-1], z1, zp1
             )
-            z = z[::-1, x_size + y_size :]
+            z = z[::-1, x_size:]
             # jax.debug.print("Adjoint: {z}", z=z)
             # jax.debug.print("Adjoint ts: {ts}", ts=ts)
             integral = jax.vmap(da_fn, in_axes=(None, 0, 0, 0, 0))(params, ts, x, y, z)
