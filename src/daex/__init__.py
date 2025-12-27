@@ -296,8 +296,8 @@ class IDA(eqx.Module):
             ],
         ) -> tuple[
             Any,  # parmas
-            None,  # t1
-            None,  # t0
+            Float[Array, ""],  # t1
+            Float[Array, ""],  # t0
             None,  # x0
             Float[Array, "y_size"],  # y0
             None,  # yp0
@@ -307,13 +307,17 @@ class IDA(eqx.Module):
             t1 = ts[-1]
             x1 = x[-1]
             y1 = y[-1]
+            yp1 = yp[-1]
             yfunc = HermiteSpline(ts, y, yp)
 
-            dgda, dgdx, dgdy = jax.jacrev(const_fn, argnums=[0, 2, 3])(
+            dgda, dgdt, dgdx, dgdy = jax.jacrev(const_fn, argnums=[0, 1, 2, 3])(
                 params, t1, x1, y1
             )
             dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[2, 3])(params, t1, x1, y1)
             lu_dgdx = jsp.linalg.lu_factor(dgdx)
+            dJdt = jnp.dot(wy, yp1) - jnp.dot(
+                wx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1)
+            )
             dJda = jax.tree.map(
                 lambda dgda0: -jsp.linalg.lu_solve(lu_dgdx, dgda0).T @ wx, dgda
             )
@@ -329,10 +333,12 @@ class IDA(eqx.Module):
                 _run_adjoint, z_type, params, yfunc, ts[::-1], z1, zp1
             )
             z = z[::-1, x_size:]
+            # jax.debug.print("Adjoint: {z}", z=z)
+            # jax.debug.print("Adjoint ts: {ts}", ts=ts)
             integral = jax.vmap(da_fn, in_axes=(None, 0, 0, 0, 0))(params, ts, x, y, z)
             dJda = jax.tree.map(lambda a1, a2: a1 + jnp.dot(ws, a2), dJda, integral)
 
-            return (dJda, None, None, None, z[0], None)
+            return (dJda, dJdt, -jnp.dot(z[0], yp[0]), None, z[0], None)
 
         dae_step.defvjp(dae_step_fwd, dae_step_bwd)
         result_y = [xy0]
