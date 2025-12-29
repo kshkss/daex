@@ -9,6 +9,7 @@ import equinox as eqx
 from jaxtyping import Array, Float
 
 from daex.utils import HermiteSpline
+from daex import utils
 
 
 class IDA(eqx.Module):
@@ -31,6 +32,13 @@ class IDA(eqx.Module):
         yp0 = self.deriv_fn(params, ts[0], xy0)
         x0 = jax.tree.map(lambda xy, yp: xy if yp is None else None, xy0, yp0)
         y0 = jax.tree.map(lambda xy, yp: xy if yp is not None else None, xy0, yp0)
+        try:
+            utils.assert_trees_shape_equal(y0, yp0)
+        except AssertionError as e:
+            raise ValueError(
+                "The shapes of initial conditions of differential variables and their derivative do not match. "
+                "Check the initial conditions and deriv_fn()."
+            ) from e
         x, unravel_x = ravel_pytree(x0)
         y, unravel_y = ravel_pytree(y0)
         yp, _ = ravel_pytree(yp0)
