@@ -2,6 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "altair==6.0.0",
+#     "chex==0.1.91",
 #     "daex",
 #     "jax==0.8.2",
 #     "numpy==2.4.0",
@@ -28,16 +29,17 @@ def _():
     import equinox as eqx
     import polars as pl
     import altair as alt
-    return IDA, alt, eqx, jax, jnp, np, pl
+    from typing import NamedTuple
+    return IDA, NamedTuple, alt, jax, jnp, np, pl
 
 
 @app.cell
-def _(IDA, eqx, jax, jnp):
-    class State(eqx.Module):
+def _(IDA, NamedTuple, jax, jnp):
+    class State(NamedTuple):
         x: jax.Array
         y: jax.Array
 
-    class Params(eqx.Module):
+    class Params(NamedTuple):
         a: jax.Array
 
     def derivative(params: Params, t: jax.Array, stat: State) -> State:
@@ -52,7 +54,33 @@ def _(IDA, eqx, jax, jnp):
     solver = IDA(deriv_fn=derivative, const_fn=constraint)
     params = Params(a=jnp.array(1.0))
     u, v = solver.solve(params, jnp.linspace(0, 1, 11), State(y=jnp.array(1.0), x=jnp.array(1.0)))
-    return State, params, solver, u
+    return State, derivative, params, solver, u, v
+
+
+@app.cell
+def _(u):
+    u
+    return
+
+
+@app.cell
+def _(v):
+    v
+    return
+
+
+@app.cell
+def _(State, jnp):
+    _x = State(y=jnp.ones(1), x=jnp.ones(1))
+    _x
+    return
+
+
+@app.cell
+def _(State, derivative, jnp, params):
+    _x = State(y=jnp.array(1.0), x=jnp.array(1.0))
+    derivative(params, jnp.array(1.0), _x)
+    return
 
 
 @app.cell
@@ -150,45 +178,21 @@ def _(alt, df):
 
 @app.cell
 def _(State, jax, jnp, params, solver):
-    def loss(params, y0):
-        u, v = solver.solve(params, jnp.linspace(0, 1, 11), State(y=y0, x=jnp.sqrt(y0)))
-        return u.y[-1]
+    def loss(params, t, y0):
+        u, v = solver.solve(params, t, State(y=y0, x=jnp.sqrt(y0)))
+        return u.y[-1][0]
 
-    jax.value_and_grad(loss, argnums=1)(params, jnp.array(1.0))
-    return (loss,)
-
-
-@app.cell
-def _(jax, jnp, loss, params):
-    jax.grad(loss, argnums=0)(params, jnp.array(1.0)).a
-    return
-
-
-@app.cell
-def _(jax, jnp):
-    jax.grad(lambda a: jnp.exp(1.0 * a))(jnp.array(1.0))
+    jax.value_and_grad(loss, argnums=[0, 1, 2])(params, jnp.linspace(0, 1, 11), jnp.array(1.0))
     return
 
 
 @app.cell
 def _(State, jax, jnp, params, solver):
-    def loss2(params, y0):
-        u, v = solver.solve(params, jnp.linspace(0, 1, 11), State(y=y0, x=jnp.sqrt(y0)))
+    def loss2(params, t, y0):
+        u, v = solver.solve(params, t, State(y=y0, x=jnp.sqrt(y0)))
         return u.x[-1]
 
-    jax.value_and_grad(loss2, argnums=1)(params, jnp.array(1.0))
-    return (loss2,)
-
-
-@app.cell
-def _(jax, jnp, loss2, params):
-    jax.grad(loss2, argnums=0)(params, jnp.array(1.0)).a
-    return
-
-
-@app.cell
-def _(jax, jnp):
-    jax.grad(lambda a: jnp.exp(0.5 * 1.0 * a))(jnp.array(1.0))
+    jax.value_and_grad(loss2, argnums=[0, 1, 2])(params, jnp.linspace(0, 1, 11), jnp.array(1.0))
     return
 
 
