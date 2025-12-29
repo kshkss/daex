@@ -3,6 +3,31 @@ import jax.numpy as jnp
 import equinox as eqx
 from typing import Any
 from jaxtyping import Array, Float
+import chex
+
+
+def assert_trees_shape_equal(tree1: Any, tree2: Any):  # , err_msg: str = ""):
+    """
+    2つのpytreeが構造とテンソルの形状まで完全に一致することを確認
+
+    Args:
+        tree1: 最初のpytree
+        tree2: 2番目のpytree
+        err_msg: エラーメッセージのプレフィックス
+
+    Raises:
+        AssertionError: 構造または形状が一致しない場合
+    """
+    # 構造の一致を確認
+    chex.assert_trees_all_equal_structs(tree1, tree2)
+
+    # 各リーフの形状を取得
+    leaves1, _ = jax.tree.flatten(tree1)
+    leaves2, _ = jax.tree.flatten(tree2)
+
+    # 全てのリーフの形状が一致することを確認
+    for leaf1, leaf2 in zip(leaves1, leaves2):
+        chex.assert_equal_shape([leaf1, leaf2])
 
 
 def hermite_interpolate(x, x0, x1, y0, y1, dy0, dy1):
