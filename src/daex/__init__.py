@@ -386,21 +386,18 @@ class IDA(eqx.Module):
             wx = wx[::-1]
             wy = wy[::-1]
             wyp = wyp[::-1]
-
-            dJdt = []
-            dJdy0 = jnp.zeros_like(wy[0])
-            dJda = jax.tree.map(lambda a: jnp.zeros_like(a), params)
-            dJdt0_prev = 0.0
             n = 4 - 1
-            for i in range(points - 1):
+
+            def body(i, carry):
+                dJda, dJdt0_prev, dJdt, dJdy0 = carry
                 dJda0, dJdt1, dJdt0, _, dJdy0, _ = dae_step_bwd(
                     residuals=(
                         params,
-                        ts[i * n : i * n + 4][::-1],
-                        ws[i * n : i * n + 4][::-1],
-                        x[i * n : i * n + 4][::-1],
-                        y[i * n : i * n + 4][::-1],
-                        yp[i * n : i * n + 4][::-1],
+                        jax.lax.dynamic_slice_in_dim(ts, i * n, 4)[::-1],
+                        jax.lax.dynamic_slice_in_dim(ws, i * n, 4)[::-1],
+                        jax.lax.dynamic_slice_in_dim(x, i * n, 4)[::-1],
+                        jax.lax.dynamic_slice_in_dim(y, i * n, 4)[::-1],
+                        jax.lax.dynamic_slice_in_dim(yp, i * n, 4)[::-1],
                     ),
                     cotangents=(
                         wx[i],
@@ -408,12 +405,25 @@ class IDA(eqx.Module):
                         wyp[i],
                     ),
                 )
-                dJdt.append(dJdt1 + dJdt0_prev)
+                dJdt = dJdt.at[i].set(dJdt1 + dJdt0_prev)
                 dJdt0_prev = dJdt0
                 dJda = jax.tree.map(lambda a1, a2: a1 + a2, dJda, dJda0)
-            dJdt.append(dJdt0_prev)
+                return dJda, dJdt0_prev, dJdt, dJdy0
 
-            return (dJda, jnp.stack(dJdt)[::-1], None, dJdy0, None)
+            dJda, dJdt0_prev, dJdt, dJdy0 = jax.lax.fori_loop(
+                0,
+                points - 1,
+                body,
+                (
+                    jax.tree.map(lambda a: jnp.zeros_like(a), params),
+                    0.0,
+                    jnp.zeros(points),
+                    jnp.zeros_like(wy[0]),
+                ),
+            )
+            dJdt = dJdt.at[-1].set(dJdt0_prev)
+
+            return (dJda, dJdt[::-1], None, dJdy0, None)
 
         def dae_step_bwd(
             residuals: tuple[
