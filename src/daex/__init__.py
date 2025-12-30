@@ -1,4 +1,4 @@
-from typing import Callable, Any
+from typing import Callable, Any, NamedTuple
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
@@ -10,6 +10,11 @@ from jaxtyping import Array, Float
 
 from daex.utils import HermiteSpline
 from daex import utils
+
+
+class Results[U](NamedTuple):
+    values: U
+    derivatives: U
 
 
 class IDA(eqx.Module):
@@ -27,7 +32,7 @@ class IDA(eqx.Module):
         self.const_fn = const_fn
         self.options = options
 
-    def solve[U](self, params: Any, ts: jax.Array, xy0: U) -> tuple[U, U]:
+    def solve[U](self, params: Any, ts: jax.Array, xy0: U) -> Results[U]:
         options = self.options.copy()
         yp0 = self.deriv_fn(params, ts[0], xy0)
         x0 = jax.tree.map(lambda xy, yp: xy if yp is None else None, xy0, yp0)
@@ -339,6 +344,7 @@ class IDA(eqx.Module):
             result_y.append(eqx.combine(unravel_x(x), unravel_y(y)))
             result_yp.append(unravel_y(yp))
 
-        return jax.tree.map(lambda *x: jnp.stack(x, axis=0), *result_y), jax.tree.map(
-            lambda *x: jnp.stack(x, axis=0), *result_yp
+        return Results(
+            values=jax.tree.map(lambda *x: jnp.stack(x, axis=0), *result_y),
+            derivatives=jax.tree.map(lambda *x: jnp.stack(x, axis=0), *result_yp),
         )
