@@ -229,34 +229,6 @@ class IDA(eqx.Module):
 
             return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
 
-        @jax.custom_vjp
-        def dae_step(
-            params: Any,
-            t1: Float[Array, ""],
-            t0: Float[Array, ""],
-            x0: Float[Array, "x_size"],
-            y0: Float[Array, "y_size"],
-            yp0: Float[Array, "y_size"],
-        ) -> tuple[
-            Float[Array, "x_size"],
-            Float[Array, "y_size"],
-            Float[Array, "y_size"],
-        ]:
-            """Perform the first step of DAE integration using IDA solver."""
-
-            # ida = _IDA(userdata=params, **args)
-            ts = jnp.stack([t0, t1])
-            xy = jnp.concatenate([x0, y0])
-            xyp = jnp.concatenate([jnp.zeros_like(x0), yp0])
-            y_type = jax.ShapeDtypeStruct([2] + list(xy.shape), xy.dtype)
-            yp_type = jax.ShapeDtypeStruct([2] + list(xyp.shape), xyp.dtype)
-
-            xy, xyp = jax.pure_callback(
-                _run_forward, (y_type, yp_type), params, ts, xy, xyp
-            )
-
-            return xy[-1, :x_size], xy[-1, x_size:], xyp[-1, x_size:]
-
         def dae_solve_fwd(
             params: Any,
             ts: Float[Array, "points"],
@@ -291,61 +263,6 @@ class IDA(eqx.Module):
             x1 = y[::3, :x_size]
             y1 = y[::3, x_size:]
             yp1 = yp[::3, x_size:]
-            return (x1, y1, yp1), (
-                params,
-                ts,
-                ws,
-                y[:, :x_size],
-                y[:, x_size:],
-                yp[:, x_size:],
-            )
-
-        def dae_step_fwd(
-            params: Any,
-            t1: Float[Array, ""],
-            t0: Float[Array, ""],
-            x0: Float[Array, "x_size"],
-            y0: Float[Array, "y_size"],
-            yp0: Float[Array, "y_size"],
-        ) -> tuple[
-            tuple[
-                Float[Array, "x_size"], Float[Array, "y_size"], Float[Array, "y_size"]
-            ],
-            tuple[
-                Any,
-                Float[Array, "4"],
-                Float[Array, "4"],
-                Float[Array, "4 x_size"],
-                Float[Array, "4 y_size"],
-                Float[Array, "4 y_size"],
-            ],
-        ]:
-            ws = (
-                0.5
-                * (t1 - t0)
-                * jnp.array(
-                    [
-                        0.1666666666666666666667,
-                        0.8333333333333333333333,
-                        0.833333333333333333333,
-                        0.1666666666666666666667,
-                    ]
-                )
-            )
-            ts = 0.5 * (t1 + t0) + 0.5 * (t1 - t0) * jnp.array(
-                [-1.0, -0.447213595499957939282, 0.447213595499957939282, 1]
-            )
-            y = jnp.concatenate([x0, y0])
-            yp = jnp.concatenate([jnp.zeros_like(x0), yp0])
-            y_type = jax.ShapeDtypeStruct([4] + list(y.shape), y.dtype)
-            yp_type = jax.ShapeDtypeStruct([4] + list(y.shape), yp.dtype)
-
-            y, yp = jax.pure_callback(
-                _run_forward, (y_type, yp_type), params, ts, y, yp
-            )
-            x1 = y[-1, :x_size]
-            y1 = y[-1, x_size:]
-            yp1 = yp[-1, x_size:]
             return (x1, y1, yp1), (
                 params,
                 ts,
@@ -495,7 +412,6 @@ class IDA(eqx.Module):
 
             return (dJda, dJdt, -jnp.dot(z[0], yp[0]), None, z[0], None)
 
-        dae_step.defvjp(dae_step_fwd, dae_step_bwd)
         dae_solve.defvjp(dae_solve_fwd, dae_solve_bwd)
 
         def clear_cache():
