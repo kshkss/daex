@@ -313,16 +313,28 @@ class IDA(eqx.Module):
             dgda, dgdt, dgdx, dgdy = jax.jacrev(const_fn, argnums=[0, 1, 2, 3])(
                 params, t1, x1, y1
             )
-            dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[2, 3])(params, t1, x1, y1)
+            dfda, dfdt, dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[0, 1, 2, 3])(
+                params, t1, x1, y1
+            )
             lu_dgdx = jsp.linalg.lu_factor(dgdx)
-            dJdt = jnp.dot(wy, yp1) - jnp.dot(
-                wx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1)
+            wxx = wx + dfdx.T @ wyp
+            dJdt = (
+                jnp.dot(wy, yp1)
+                + jnp.dot(wyp, dfdt + dfdy @ yp1)
+                - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
             )
             dJda = jax.tree.map(
-                lambda dgda0: -jsp.linalg.lu_solve(lu_dgdx, dgda0).T @ wx, dgda
+                lambda dfda0, dgda0: jnp.dot(wyp, dfda0)
+                - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda0)),
+                dfda,
+                dgda,
             )
 
-            z1 = wy - jsp.linalg.lu_solve(lu_dgdx, dgdy).T @ wx
+            z1 = (
+                wy
+                + jnp.dot(wyp, dfdy)
+                - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
+            )
             dz1 = dfdy - dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgdy)
             zp1 = -dz1.T @ z1
             z1 = jnp.concatenate([x1, z1])
