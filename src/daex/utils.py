@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 import equinox as eqx
-from typing import Any
+from typing import Any, NamedTuple
 from jaxtyping import Array, Float
 import chex
 
@@ -28,6 +28,35 @@ def assert_trees_shape_equal(tree1: Any, tree2: Any):  # , err_msg: str = ""):
     # 全てのリーフの形状が一致することを確認
     for leaf1, leaf2 in zip(leaves1, leaves2):
         chex.assert_equal_shape([leaf1, leaf2])
+
+
+class Quadrature(NamedTuple):
+    points: jax.Array
+    weights: jax.Array
+
+
+def divide_intervals(t0: jax.Array, t1: jax.Array, n: int = 4) -> Quadrature:
+    t0 = t0.reshape([-1, 1])
+    t1 = t1.reshape([-1, 1])
+    _ws = (
+        0.5
+        * (t1 - t0)
+        * jnp.array(
+            [
+                0.1666666666666666666667,
+                0.8333333333333333333333,
+                0.833333333333333333333,
+                0.1666666666666666666667,
+            ]
+        )
+    )
+    _ts = 0.5 * (t1 + t0) + 0.5 * (t1 - t0) * jnp.array(
+        [-1.0, -0.447213595499957939282, 0.447213595499957939282, 1]
+    )
+    ws = jnp.append(_ws[:, :-1].flatten(), _ws[-1, -1])
+    ts = jnp.append(_ts[:, :-1].flatten(), _ts[-1, -1])
+
+    return Quadrature(points=ts, weights=ws)
 
 
 def hermite_interpolate(x, x0, x1, y0, y1, dy0, dy1):
