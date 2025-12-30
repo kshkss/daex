@@ -18,7 +18,7 @@ class Results[U](NamedTuple):
     clear_cache: Callable[[], None]
 
 
-class IDA(eqx.Module):
+class SemiExplicitDAE(eqx.Module):
     """
     Wrapper of SUNDIALS IDA solver.
     This solves semi-implicit DAE like y' = f(t, x, y), g(t, x, y) = 0.
