@@ -7,7 +7,7 @@ from jax.flatten_util import ravel_pytree
 from sksundae._cy_ida import IDA as _IDA
 import equinox as eqx
 from jaxtyping import Array, Float
-
+import chex
 from daex.utils import HermiteSpline
 from daex import utils
 
@@ -50,6 +50,7 @@ class IDA(eqx.Module):
         yp, _ = ravel_pytree(yp0)
         x_size = x.size
         y_size = y.size
+        points = ts.shape[0]
 
         options["algebraic_idx"] = np.arange(x_size)
 
@@ -204,6 +205,31 @@ class IDA(eqx.Module):
             return results.y
 
         @jax.custom_vjp
+        def dae_solve(
+            params: Any,
+            ts: Float[Array, "points"],
+            x0: Float[Array, "x_size"],
+            y0: Float[Array, "y_size"],
+            yp0: Float[Array, "y_size"],
+        ) -> tuple[
+            Float[Array, "x_size"],
+            Float[Array, "y_size"],
+            Float[Array, "y_size"],
+        ]:
+            """Perform the first step of DAE integration using IDA solver."""
+
+            xy = jnp.concatenate([x0, y0])
+            xyp = jnp.concatenate([jnp.zeros_like(x0), yp0])
+            y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
+            yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
+
+            xy, xyp = jax.pure_callback(
+                _run_forward, (y_type, yp_type), params, ts, xy, xyp
+            )
+
+            return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
+
+        @jax.custom_vjp
         def dae_step(
             params: Any,
             t1: Float[Array, ""],
@@ -230,6 +256,49 @@ class IDA(eqx.Module):
             )
 
             return xy[-1, :x_size], xy[-1, x_size:], xyp[-1, x_size:]
+
+        def dae_solve_fwd(
+            params: Any,
+            ts: Float[Array, "points"],
+            x0: Float[Array, "x_size"],
+            y0: Float[Array, "y_size"],
+            yp0: Float[Array, "y_size"],
+        ) -> tuple[
+            tuple[
+                Float[Array, "points x_size"],
+                Float[Array, "points y_size"],
+                Float[Array, "points y_size"],
+            ],
+            tuple[
+                Any,
+                Float[Array, "3*points-2"],
+                Float[Array, "3*points-2"],
+                Float[Array, "3*points-2 x_size"],
+                Float[Array, "3*points-2 y_size"],
+                Float[Array, "3*points-2 y_size"],
+            ],
+        ]:
+            ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=4)
+            chex.assert_shape(ts, (3 * points - 2,))
+            y = jnp.concatenate([x0, y0])
+            yp = jnp.concatenate([jnp.zeros_like(x0), yp0])
+            y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(y.shape), y.dtype)
+            yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(y.shape), yp.dtype)
+
+            y, yp = jax.pure_callback(
+                _run_forward, (y_type, yp_type), params, ts, y, yp
+            )
+            x1 = y[::3, :x_size]
+            y1 = y[::3, x_size:]
+            yp1 = yp[::3, x_size:]
+            return (x1, y1, yp1), (
+                params,
+                ts,
+                ws,
+                y[:, :x_size],
+                y[:, x_size:],
+                yp[:, x_size:],
+            )
 
         def dae_step_fwd(
             params: Any,
@@ -285,6 +354,66 @@ class IDA(eqx.Module):
                 y[:, x_size:],
                 yp[:, x_size:],
             )
+
+        def dae_solve_bwd(
+            residuals: tuple[
+                Any,
+                Float[Array, "3*points-2"],
+                Float[Array, "3*points-2"],
+                Float[Array, "3*points-2 x_size"],
+                Float[Array, "3*points-2 y_size"],
+                Float[Array, "3*points-2 y_size"],
+            ],
+            cotangents: tuple[
+                Float[Array, "points x_size"],
+                Float[Array, "points y_size"],
+                Float[Array, "points y_size"],
+            ],
+        ) -> tuple[
+            Any,  # parmas
+            Float[Array, "points"],  # ts
+            None,  # x0
+            Float[Array, "y_size"],  # y0
+            None,  # yp0
+        ]:
+            params, ts, ws, x, y, yp = residuals
+            wx, wy, wyp = cotangents
+            ts = ts[::-1]
+            ws = ws[::-1]
+            x = x[::-1]
+            y = y[::-1]
+            yp = yp[::-1]
+            wx = wx[::-1]
+            wy = wy[::-1]
+            wyp = wyp[::-1]
+
+            dJdt = []
+            dJdy0 = jnp.zeros_like(wy[0])
+            dJda = jax.tree.map(lambda a: jnp.zeros_like(a), params)
+            dJdt0_prev = 0.0
+            n = 4 - 1
+            for i in range(points - 1):
+                dJda0, dJdt1, dJdt0, _, dJdy0, _ = dae_step_bwd(
+                    residuals=(
+                        params,
+                        ts[i * n : i * n + 4][::-1],
+                        ws[i * n : i * n + 4][::-1],
+                        x[i * n : i * n + 4][::-1],
+                        y[i * n : i * n + 4][::-1],
+                        yp[i * n : i * n + 4][::-1],
+                    ),
+                    cotangents=(
+                        wx[i],
+                        wy[i] + dJdy0,
+                        wyp[i],
+                    ),
+                )
+                dJdt.append(dJdt1 + dJdt0_prev)
+                dJdt0_prev = dJdt0
+                dJda = jax.tree.map(lambda a1, a2: a1 + a2, dJda, dJda0)
+            dJdt.append(dJdt0_prev)
+
+            return (dJda, jnp.stack(dJdt)[::-1], None, dJdy0, None)
 
         def dae_step_bwd(
             residuals: tuple[
