@@ -159,19 +159,17 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             yp = jnp.asarray(yp)
             res[:] = resfn(params, t, y, yp)[0]
 
-        if "jacfn" not in self.options:
+        def jacfn_wrapper(t, y, yp, res, cj, JJ, userdata):
+            params = userdata
+            t = jnp.asarray(t)
+            y = jnp.asarray(y)
+            yp = jnp.asarray(yp)
+            (dy, dyp), _ = jax.jacfwd(resfn, argnums=[2, 3], has_aux=True)(
+                params, t, y, yp
+            )
+            JJ[:, :] = dy + cj * dyp
 
-            def jacfn_wrapper(t, y, yp, res, cj, JJ, userdata):
-                params = userdata
-                t = jnp.asarray(t)
-                y = jnp.asarray(y)
-                yp = jnp.asarray(yp)
-                (dy, dyp), _ = jax.jacfwd(resfn, argnums=[2, 3], has_aux=True)(
-                    params, t, y, yp
-                )
-                JJ[:, :] = dy + cj * dyp
-
-            self.options["jacfn"] = jacfn_wrapper
+        self.options["jacfn"] = jacfn_wrapper
 
         def resfn_adj_wrapper(t, y, yp, res, userdata):
             params, yfunc = userdata
