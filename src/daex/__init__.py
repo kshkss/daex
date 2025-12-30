@@ -30,6 +30,21 @@ class SemiExplicitDAE(eqx.Module):
     options: dict
 
     def __init__(self, deriv_fn: Callable, const_fn: Callable, **options):
+        """
+        Initialize the SemiExplicitDAE class.
+
+        Parameters:
+        - deriv_fn (Callable): A function that takes parameters, a coordinate `t`, and variables `x` and `y`.
+          It returns the derivative `y'` of the differential variables `y`. The parameters and variables are pytrees.
+          The return value `y'` is a pytree with the same structure as the input `x` and `y`,
+          but with `None` in the positions corresponding to the algebraic variables `x`.
+
+        - const_fn (Callable): A function that takes the same arguments as `deriv_fn` and returns the residuals
+          of the constraints for the algebraic variables. The algebraic variables are computed such that the return value
+          of `const_fn` becomes zero. If you want to solve an explicit ODE, you can pass a function that returns `None`.
+
+        - options (dict): Additional options for the solver.
+        """
         self.deriv_fn = deriv_fn
         self.const_fn = const_fn
         self.options = options
