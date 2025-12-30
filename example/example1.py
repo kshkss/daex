@@ -25,11 +25,12 @@ def _():
     import jax
     import jax.numpy as jnp
     import numpy as np
-    from daex import IDA
+    from daex import SemiExplicitDAE as IDA
     import equinox as eqx
     import polars as pl
     import altair as alt
     from typing import NamedTuple
+
     return IDA, NamedTuple, alt, jax, jnp, np, pl
 
 
