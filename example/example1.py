@@ -55,7 +55,7 @@ def _(IDA, NamedTuple, jax, jnp):
     params = Params(a=jnp.array(1.0))
     u, v, clear_cache = solver.solve(params, jnp.linspace(0, 1, 11), State(y=jnp.array([2.0, 1.0]), x=jnp.sqrt(3.0)))
     clear_cache()
-    return State, params, solver, u, v
+    return Params, State, params, solver, u, v
 
 
 @app.cell
@@ -190,6 +190,40 @@ def _(State, jax, jnp, params, solver):
         return v.y[-1, 1]
 
     jax.value_and_grad(loss3, argnums=[0, 1, 2])(params, jnp.linspace(0, 1, 11), jnp.array([2.0, 1.0]))
+    return
+
+
+@app.cell
+def _(IDA, NamedTuple, Params, State, jax, jnp, params):
+    class _State(NamedTuple):
+        y: jax.Array
+
+    class _Params(NamedTuple):
+        a: jax.Array
+
+    def _derivative(params: Params, t: jax.Array, stat: _State) -> State:
+        return _State(
+            y=stat.y * params.a,
+        )
+
+    def _constraint(params: Params, t: jax.Array, stat: _State) -> jax.Array:
+        return None
+
+    _solver = IDA(deriv_fn=_derivative, const_fn=_constraint)
+    _params = _Params(a=jnp.array(1.0))
+    _u, _v, _clear_cache = _solver.solve(params, jnp.linspace(0, 1, 11), _State(y=jnp.array([2.0, 1.0])))
+    _clear_cache()
+
+    def _loss(params, t, y0):
+        u, v, _ = _solver.solve(params, t, _State(y=y0))
+        return u.y[-1, 1]
+
+    jax.value_and_grad(_loss, argnums=[0, 1, 2])(params, jnp.linspace(0, 1, 11), jnp.array([2.0, 1.0]))
+    return
+
+
+@app.cell
+def _():
     return
 
 
