@@ -15,6 +15,7 @@ from daex import utils
 class Results[U](NamedTuple):
     values: U
     derivatives: U
+    clear_cache: Callable[[], None]
 
 
 class IDA(eqx.Module):
@@ -356,16 +357,27 @@ class IDA(eqx.Module):
             return (dJda, dJdt, -jnp.dot(z[0], yp[0]), None, z[0], None)
 
         dae_step.defvjp(dae_step_fwd, dae_step_bwd)
+
+        def clear_cache():
+            resfn._clear_cache()
+            resfn_adj._clear_cache()
+            da_fn._clear_cache()
+
         result_y = [xy0]
         result_yp = [yp0]
         t0 = ts[0]
-        for t1 in ts[1:]:
-            x, y, yp = dae_step(params, t1, t0, x, y, yp)
-            t0 = t1
-            result_y.append(eqx.combine(unravel_x(x), unravel_y(y)))
-            result_yp.append(unravel_y(yp))
+        try:
+            for t1 in ts[1:]:
+                x, y, yp = dae_step(params, t1, t0, x, y, yp)
+                t0 = t1
+                result_y.append(eqx.combine(unravel_x(x), unravel_y(y)))
+                result_yp.append(unravel_y(yp))
+        except:
+            clear_cache()
+            raise
 
         return Results(
             values=jax.tree.map(lambda *x: jnp.stack(x, axis=0), *result_y),
             derivatives=jax.tree.map(lambda *x: jnp.stack(x, axis=0), *result_yp),
+            clear_cache=clear_cache,
         )
