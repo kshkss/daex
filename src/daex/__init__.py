@@ -85,6 +85,7 @@ class IDA(eqx.Module):
             dz = -dfdz.T @ zarray
             return dz
 
+        @jax.jit
         def da_fn(
             params: Any,
             t: jax.Array,
@@ -101,6 +102,7 @@ class IDA(eqx.Module):
             da = jax.tree.map(lambda a1, a2: (a1 - a2).T @ zarray, dfda, dfda_x)
             return da
 
+        @jax.jit
         def resfn(
             params: Any,
             t: jax.Array,
@@ -115,6 +117,7 @@ class IDA(eqx.Module):
             res = jnp.concatenate([yp_est - yparray, garray])
             return res, None
 
+        @jax.jit
         def resfn_adj(
             params: Any,
             yfunc: Callable,
