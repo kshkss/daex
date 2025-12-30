@@ -18,15 +18,15 @@ class Results[U](NamedTuple):
     clear_cache: Callable[[], None]
 
 
-class SemiExplicitDAE(eqx.Module):
+class SemiExplicitDAE[Params, Var](eqx.Module):
     """
     INterface of SUNDIALS IDA solver for systems defined as
     explicit ODE like y' = f(t, y),
     and semi-explicit DAE like y' = f(t, x, y), g(t, x, y) = 0.
     """
 
-    deriv_fn: Callable[[Any, jax.Array, Any], Any]
-    const_fn: Callable[[Any, jax.Array, Any], Any]
+    deriv_fn: Callable[[Params, jax.Array, Var], Var]
+    const_fn: Callable[[Params, jax.Array, Var], Any]
     options: dict
 
     def __init__(self, deriv_fn: Callable, const_fn: Callable, **options):
@@ -49,7 +49,7 @@ class SemiExplicitDAE(eqx.Module):
         self.const_fn = const_fn
         self.options = options
 
-    def solve[U](self, params: Any, ts: jax.Array, xy0: U) -> Results[U]:
+    def solve(self, params: Params, ts: jax.Array, xy0: Var) -> Results[Var]:
         options = self.options.copy()
         yp0 = self.deriv_fn(params, ts[0], xy0)
         x0 = jax.tree.map(lambda xy, yp: xy if yp is None else None, xy0, yp0)
@@ -71,7 +71,7 @@ class SemiExplicitDAE(eqx.Module):
         options["algebraic_idx"] = np.arange(x_size)
 
         def deriv_fn(
-            params: Any, t: jax.Array, xarray: jax.Array, yarray: jax.Array
+            params: Params, t: jax.Array, xarray: jax.Array, yarray: jax.Array
         ) -> jax.Array:
             x = unravel_x(xarray)
             y = unravel_y(yarray)
@@ -81,7 +81,7 @@ class SemiExplicitDAE(eqx.Module):
             return yparray
 
         def const_fn(
-            params: Any, t: jax.Array, xarray: jax.Array, yarray: jax.Array
+            params: Params, t: jax.Array, xarray: jax.Array, yarray: jax.Array
         ) -> jax.Array:
             x = unravel_x(xarray)
             y = unravel_y(yarray)
@@ -91,7 +91,7 @@ class SemiExplicitDAE(eqx.Module):
             return garray
 
         def adjfn(
-            params: Any,
+            params: Params,
             t: jax.Array,
             xarray: jax.Array,
             yarray: jax.Array,
@@ -105,7 +105,7 @@ class SemiExplicitDAE(eqx.Module):
 
         @jax.jit
         def da_fn(
-            params: Any,
+            params: Params,
             t: jax.Array,
             xarray: jax.Array,
             yarray: jax.Array,
@@ -122,7 +122,7 @@ class SemiExplicitDAE(eqx.Module):
 
         @jax.jit
         def resfn(
-            params: Any,
+            params: Params,
             t: jax.Array,
             y: jax.Array,
             yp: jax.Array,
@@ -137,7 +137,7 @@ class SemiExplicitDAE(eqx.Module):
 
         @jax.jit
         def resfn_adj(
-            params: Any,
+            params: Params,
             yfunc: Callable,
             t: jax.Array,
             y: jax.Array,
@@ -194,7 +194,7 @@ class SemiExplicitDAE(eqx.Module):
         options_ad["jacfn"] = jacfn_adj_wrapper
         options_ad["algebraic_idx"] = np.arange(x_size)
 
-        def _run_forward(params: Any, ts: jax.Array, y0: jax.Array, yp0: jax.Array):
+        def _run_forward(params: Params, ts: jax.Array, y0: jax.Array, yp0: jax.Array):
             ida = _IDA(resfn_wrapper, userdata=params, **options)
             results = ida.solve(ts, y0, yp0)
             if not results.success:
@@ -208,7 +208,11 @@ class SemiExplicitDAE(eqx.Module):
             return y, yp
 
         def _run_adjoint(
-            params: Any, yfunc: Callable, ts: jax.Array, y0: jax.Array, yp0: jax.Array
+            params: Params,
+            yfunc: Callable,
+            ts: jax.Array,
+            y0: jax.Array,
+            yp0: jax.Array,
         ):
             ida = _IDA(
                 resfn_adj_wrapper,
@@ -222,7 +226,7 @@ class SemiExplicitDAE(eqx.Module):
 
         @jax.custom_vjp
         def dae_solve(
-            params: Any,
+            params: Params,
             ts: Float[Array, "points"],
             x0: Float[Array, "x_size"],
             y0: Float[Array, "y_size"],
@@ -246,7 +250,7 @@ class SemiExplicitDAE(eqx.Module):
             return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
 
         def dae_solve_fwd(
-            params: Any,
+            params: Params,
             ts: Float[Array, "points"],
             x0: Float[Array, "x_size"],
             y0: Float[Array, "y_size"],
@@ -258,7 +262,7 @@ class SemiExplicitDAE(eqx.Module):
                 Float[Array, "points y_size"],
             ],
             tuple[
-                Any,
+                Params,
                 Float[Array, "3*points-2"],
                 Float[Array, "3*points-2"],
                 Float[Array, "3*points-2 x_size"],
@@ -290,7 +294,7 @@ class SemiExplicitDAE(eqx.Module):
 
         def dae_solve_bwd(
             residuals: tuple[
-                Any,
+                Params,
                 Float[Array, "3*points-2"],
                 Float[Array, "3*points-2"],
                 Float[Array, "3*points-2 x_size"],
@@ -303,7 +307,7 @@ class SemiExplicitDAE(eqx.Module):
                 Float[Array, "points y_size"],
             ],
         ) -> tuple[
-            Any,  # parmas
+            Params,  # parmas
             Float[Array, "points"],  # ts
             None,  # x0
             Float[Array, "y_size"],  # y0
@@ -360,7 +364,7 @@ class SemiExplicitDAE(eqx.Module):
 
         def dae_step_bwd(
             residuals: tuple[
-                Any,
+                Params,
                 Float[Array, "4"],
                 Float[Array, "4"],
                 Float[Array, "4 x_size"],
@@ -371,7 +375,7 @@ class SemiExplicitDAE(eqx.Module):
                 Float[Array, "x_size"], Float[Array, "y_size"], Float[Array, "y_size"]
             ],
         ) -> tuple[
-            Any,  # parmas
+            Params,  # parmas
             Float[Array, ""],  # t1
             Float[Array, ""],  # t0
             None,  # x0
