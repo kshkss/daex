@@ -78,7 +78,10 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         x_size = x.size
         y_size = y.size
         points = ts.shape[0]
+        n_intervals = points - 1
         quad_order = self.quad_order
+        n_split = quad_order - 1
+        interpolated = n_split * n_intervals + 1
 
         options["algebraic_idx"] = np.arange(x_size)
 
@@ -244,16 +247,16 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             ],
             tuple[
                 Params,
-                Float[Array, "3*points-2"],
-                Float[Array, "points-1 4"],
-                Float[Array, "3*points-2 x_size"],
-                Float[Array, "3*points-2 y_size"],
-                Float[Array, "3*points-2 y_size"],
+                Float[Array, "interpolated"],
+                Float[Array, "n_intervals quad_order"],
+                Float[Array, "interpolated x_size"],
+                Float[Array, "interpolated y_size"],
+                Float[Array, "interpolated y_size"],
             ],
         ]:
             ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=4)
-            chex.assert_shape(ts, (3 * points - 2,))
-            chex.assert_shape(ws, (points - 1, 4))
+            chex.assert_shape(ts, (interpolated,))
+            chex.assert_shape(ws, (n_intervals, quad_order))
 
             y = jnp.concatenate([x0, y0])
             yp = jnp.concatenate([jnp.zeros_like(x0), yp0])
@@ -284,11 +287,11 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         def dae_solve_bwd(
             residuals: tuple[
                 Params,
-                Float[Array, "3*points-2"],
-                Float[Array, "points-1 4"],
-                Float[Array, "3*points-2 x_size"],
-                Float[Array, "3*points-2 y_size"],
-                Float[Array, "3*points-2 y_size"],
+                Float[Array, "interpolated"],
+                Float[Array, "n_intervals quad_order"],
+                Float[Array, "interpolated x_size"],
+                Float[Array, "interpolated y_size"],
+                Float[Array, "interpolated y_size"],
             ],
             cotangents: tuple[
                 Float[Array, "points x_size"],
@@ -304,6 +307,14 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         ]:
             params, ts, ws, x, y, yp = residuals
             wx, wy, wyp = cotangents
+            chex.assert_shape(ts, (interpolated,))
+            chex.assert_shape(ws, (n_intervals, quad_order))
+            chex.assert_shape(x, (interpolated, x_size))
+            chex.assert_shape(y, (interpolated, y_size))
+            chex.assert_shape(yp, (interpolated, y_size))
+            chex.assert_shape(wx, (points, x_size))
+            chex.assert_shape(wy, (points, y_size))
+            chex.assert_shape(wyp, (points, y_size))
             ts = ts[::-1]
             ws = ws[::-1]
             x = x[::-1]
@@ -380,6 +391,14 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         ]:
             params, ts, ws, x, y, yp = residuals
             wx, wy, wyp = cotangents
+            chex.assert_shape(ts, (quad_order,))
+            chex.assert_shape(ws, (quad_order,))
+            chex.assert_shape(x, (quad_order, x_size))
+            chex.assert_shape(y, (quad_order, y_size))
+            chex.assert_shape(yp, (quad_order, y_size))
+            chex.assert_shape(wx, (x_size,))
+            chex.assert_shape(wy, (y_size,))
+            chex.assert_shape(wyp, (y_size,))
             t1 = ts[-1]
             x1 = x[-1]
             y1 = y[-1]
