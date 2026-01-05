@@ -34,7 +34,9 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
     const_fn: Callable[[Params, jax.Array, Var], Any]
     options: dict
 
-    def __init__(self, deriv_fn: Callable, const_fn: Callable, **options):
+    def __init__(
+        self, deriv_fn: Callable, const_fn: Callable, *, quad_order=4, **options
+    ):
         """
         Initialize the SemiExplicitDAE class.
 
@@ -54,6 +56,10 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         self.const_fn = const_fn
         self.options = options
 
+        if quad_order not in [4]:
+            raise NotImplementedError("quad_order must be 4.")
+        self.quad_order = quad_order
+
     def solve(self, params: Params, ts: jax.Array, xy0: Var) -> Results[Var]:
         options = self.options.copy()
         yp0 = self.deriv_fn(params, ts[0], xy0)
@@ -72,6 +78,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         x_size = x.size
         y_size = y.size
         points = ts.shape[0]
+        quad_order = self.quad_order
 
         options["algebraic_idx"] = np.arange(x_size)
 
@@ -297,7 +304,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         ]:
             params, ts, ws, x, y, yp = residuals
             wx, wy, wyp = cotangents
-            n = ws.shape[1]
             ts = ts[::-1]
             ws = ws[::-1]
             x = x[::-1]
@@ -312,11 +318,19 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 dJda0, dJdt1, dJdt0, _, dJdy0, _ = dae_step_bwd(
                     residuals=(
                         params,
-                        jax.lax.dynamic_slice_in_dim(ts, i * (n - 1), n)[::-1],
+                        jax.lax.dynamic_slice_in_dim(
+                            ts, i * (quad_order - 1), quad_order
+                        )[::-1],
                         ws[i],
-                        jax.lax.dynamic_slice_in_dim(x, i * (n - 1), n)[::-1],
-                        jax.lax.dynamic_slice_in_dim(y, i * (n - 1), n)[::-1],
-                        jax.lax.dynamic_slice_in_dim(yp, i * (n - 1), n)[::-1],
+                        jax.lax.dynamic_slice_in_dim(
+                            x, i * (quad_order - 1), quad_order
+                        )[::-1],
+                        jax.lax.dynamic_slice_in_dim(
+                            y, i * (quad_order - 1), quad_order
+                        )[::-1],
+                        jax.lax.dynamic_slice_in_dim(
+                            yp, i * (quad_order - 1), quad_order
+                        )[::-1],
                     ),
                     cotangents=(
                         wx[i],
@@ -347,11 +361,11 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         def dae_step_bwd(
             residuals: tuple[
                 Params,
-                Float[Array, "4"],
-                Float[Array, "4"],
-                Float[Array, "4 x_size"],
-                Float[Array, "4 y_size"],
-                Float[Array, "4 y_size"],
+                Float[Array, "quad_order"],
+                Float[Array, "quad_order"],
+                Float[Array, "quad_order x_size"],
+                Float[Array, "quad_order y_size"],
+                Float[Array, "quad_order y_size"],
             ],
             cotangents: tuple[
                 Float[Array, "x_size"], Float[Array, "y_size"], Float[Array, "y_size"]
