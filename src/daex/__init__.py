@@ -12,6 +12,11 @@ from daex.utils import HermiteSpline
 from daex import utils
 
 
+class PrimalDual(NamedTuple):
+    primals: jax.Array
+    duals: jax.Array
+
+
 class Results[U](NamedTuple):
     values: U
     derivatives: U
@@ -102,6 +107,26 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
             dz = -dfdz.T @ zarray
             return dz
+
+        def deriv_adj(
+            userdata: tuple[Params, HermiteSpline], t: jax.Array, zx: PrimalDual
+        ) -> PrimalDual:
+            params, yfunc = userdata
+            xarray = zx.primals
+            zarray = zx.duals
+            yarray = jax.lax.stop_gradient(yfunc(t))
+            return PrimalDual(
+                primals=None,
+                duals=adjfn(params, t, xarray, yarray, zarray),
+            )
+
+        def const_adj(
+            userdata: tuple[Params, HermiteSpline], t: jax.Array, zx: PrimalDual
+        ) -> jax.Array:
+            params, yfunc = userdata
+            xarray = zx.primals
+            yarray = jax.lax.stop_gradient(yfunc(t))
+            return const_fn(params, t, xarray, yarray)
 
         @jax.jit
         def da_fn(
@@ -415,16 +440,11 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 + jnp.dot(wyp, dfdy)
                 - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
             )
-            dz1 = dfdy - dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgdy)
-            zp1 = -dz1.T @ z1
-            z1 = jnp.concatenate([x1, z1])
-            zp1 = jnp.concatenate([jnp.zeros_like(x1), zp1])
-
-            z_type = jax.ShapeDtypeStruct([4] + list(z1.shape), z1.dtype)
-            z = jax.pure_callback(
-                _run_adjoint, z_type, params, yfunc, ts[::-1], z1, zp1
+            solver = SemiExplicitDAE(deriv_adj, const_adj)
+            xz, _, _ = solver.solve(
+                (params, yfunc), ts[::-1], PrimalDual(primals=x1, duals=z1)
             )
-            z = z[::-1, x_size:]
+            z = xz.duals[::-1]
             # jax.debug.print("Adjoint: {z}", z=z)
             # jax.debug.print("Adjoint ts: {ts}", ts=ts)
             integral = jax.vmap(da_fn, in_axes=(None, 0, 0, 0, 0))(params, ts, x, y, z)
