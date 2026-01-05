@@ -212,7 +212,13 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
 
             xy, xyp = jax.pure_callback(
-                _run_forward, (y_type, yp_type), params, ts, xy, xyp
+                _run_forward,
+                (y_type, yp_type),
+                params,
+                ts,
+                xy,
+                xyp,
+                vmap_method="sequential",
             )
 
             return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
@@ -248,7 +254,13 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(y.shape), yp.dtype)
 
             y, yp = jax.pure_callback(
-                _run_forward, (y_type, yp_type), params, ts, y, yp
+                _run_forward,
+                (y_type, yp_type),
+                params,
+                ts,
+                y,
+                yp,
+                vmap_method="sequential",
             )
             x1 = y[::3, :x_size]
             y1 = y[::3, x_size:]
