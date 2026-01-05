@@ -262,7 +262,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             tuple[
                 Params,
                 Float[Array, "3*points-2"],
-                Float[Array, "3*points-2"],
+                Float[Array, "points-1 4"],
                 Float[Array, "3*points-2 x_size"],
                 Float[Array, "3*points-2 y_size"],
                 Float[Array, "3*points-2 y_size"],
@@ -270,6 +270,8 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         ]:
             ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=4)
             chex.assert_shape(ts, (3 * points - 2,))
+            chex.assert_shape(ws, (points - 1, 4))
+
             y = jnp.concatenate([x0, y0])
             yp = jnp.concatenate([jnp.zeros_like(x0), yp0])
             y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(y.shape), y.dtype)
@@ -294,7 +296,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             residuals: tuple[
                 Params,
                 Float[Array, "3*points-2"],
-                Float[Array, "3*points-2"],
+                Float[Array, "points-1 4"],
                 Float[Array, "3*points-2 x_size"],
                 Float[Array, "3*points-2 y_size"],
                 Float[Array, "3*points-2 y_size"],
@@ -329,7 +331,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                     residuals=(
                         params,
                         jax.lax.dynamic_slice_in_dim(ts, i * n, 4)[::-1],
-                        jax.lax.dynamic_slice_in_dim(ws, i * n, 4)[::-1],
+                        ws[i],
                         jax.lax.dynamic_slice_in_dim(x, i * n, 4)[::-1],
                         jax.lax.dynamic_slice_in_dim(y, i * n, 4)[::-1],
                         jax.lax.dynamic_slice_in_dim(yp, i * n, 4)[::-1],

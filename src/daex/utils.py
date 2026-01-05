@@ -38,7 +38,7 @@ class Quadrature(NamedTuple):
 def divide_intervals(t0: jax.Array, t1: jax.Array, n: int = 4) -> Quadrature:
     t0 = t0.reshape([-1, 1])
     t1 = t1.reshape([-1, 1])
-    _ws = (
+    ws = (
         0.5
         * (t1 - t0)
         * jnp.array(
@@ -53,7 +53,6 @@ def divide_intervals(t0: jax.Array, t1: jax.Array, n: int = 4) -> Quadrature:
     _ts = 0.5 * (t1 + t0) + 0.5 * (t1 - t0) * jnp.array(
         [-1.0, -0.447213595499957939282, 0.447213595499957939282, 1]
     )
-    ws = jnp.append(_ws[:, :-1].flatten(), _ws[-1, -1])
     ts = jnp.append(_ts[:, :-1].flatten(), _ts[-1, -1])
 
     return Quadrature(points=ts, weights=ws)
