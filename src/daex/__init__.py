@@ -160,23 +160,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             res = jnp.concatenate([yp_est - yparray, garray])
             return res, None
 
-        @jax.jit
-        def resfn_adj(
-            params: Params,
-            yfunc: Callable,
-            t: jax.Array,
-            y: jax.Array,
-            yp: jax.Array,
-        ) -> tuple[jax.Array, None]:
-            xarray = y[:x_size]
-            yarray = yfunc(t)
-            zarray = y[x_size:]
-            zp_est = yp[x_size:]
-            garray = const_fn(params, t, xarray, yarray)
-            zparray = adjfn(params, t, xarray, yarray, zarray)
-            res = jnp.concatenate([garray, zp_est - zparray])
-            return res, None
-
         def resfn_wrapper(t, y, yp, res, userdata):
             params = userdata
             t = jnp.asarray(t)
@@ -196,27 +179,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
 
         self.options["jacfn"] = jacfn_wrapper
 
-        def resfn_adj_wrapper(t, y, yp, res, userdata):
-            params, yfunc = userdata
-            t = jnp.asarray(t)
-            y = jnp.asarray(y)
-            yp = jnp.asarray(yp)
-            res[:] = resfn_adj(params, yfunc, t, y, yp)[0]
-
-        def jacfn_adj_wrapper(t, y, yp, res, cj, JJ, userdata):
-            params, yfunc = userdata
-            t = jnp.asarray(t)
-            y = jnp.asarray(y)
-            yp = jnp.asarray(yp)
-            (dy, dyp), _ = jax.jacfwd(resfn_adj, argnums=[3, 4], has_aux=True)(
-                params, yfunc, t, y, yp
-            )
-            JJ[:, :] = dy + cj * dyp
-
-        options_ad = options.copy()
-        options_ad["jacfn"] = jacfn_adj_wrapper
-        options_ad["algebraic_idx"] = np.arange(x_size)
-
         def _run_forward(params: Params, ts: jax.Array, y0: jax.Array, yp0: jax.Array):
             ida = _IDA(resfn_wrapper, userdata=params, **options)
             results = ida.solve(ts, y0, yp0)
@@ -229,23 +191,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 y = results.y
                 yp = results.yp
             return y, yp
-
-        def _run_adjoint(
-            params: Params,
-            yfunc: Callable,
-            ts: jax.Array,
-            y0: jax.Array,
-            yp0: jax.Array,
-        ):
-            ida = _IDA(
-                resfn_adj_wrapper,
-                userdata=(params, yfunc),
-                **options_ad,
-            )
-            results = ida.solve(ts, y0, yp0)
-            if not results.success:
-                raise RuntimeError(f"Adjoint IDA solver failed: {results.message}")
-            return results.y
 
         @jax.custom_vjp
         def dae_solve(
@@ -456,7 +401,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
 
         def clear_cache():
             resfn._clear_cache()
-            resfn_adj._clear_cache()
             da_fn._clear_cache()
 
         try:
