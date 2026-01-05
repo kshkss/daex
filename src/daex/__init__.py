@@ -315,6 +315,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         ]:
             params, ts, ws, x, y, yp = residuals
             wx, wy, wyp = cotangents
+            n = ws.shape[1]
             ts = ts[::-1]
             ws = ws[::-1]
             x = x[::-1]
@@ -323,18 +324,17 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             wx = wx[::-1]
             wy = wy[::-1]
             wyp = wyp[::-1]
-            n = 4 - 1
 
             def body(i, carry):
                 dJda, dJdt0_prev, dJdt, dJdy0 = carry
                 dJda0, dJdt1, dJdt0, _, dJdy0, _ = dae_step_bwd(
                     residuals=(
                         params,
-                        jax.lax.dynamic_slice_in_dim(ts, i * n, 4)[::-1],
+                        jax.lax.dynamic_slice_in_dim(ts, i * (n - 1), n)[::-1],
                         ws[i],
-                        jax.lax.dynamic_slice_in_dim(x, i * n, 4)[::-1],
-                        jax.lax.dynamic_slice_in_dim(y, i * n, 4)[::-1],
-                        jax.lax.dynamic_slice_in_dim(yp, i * n, 4)[::-1],
+                        jax.lax.dynamic_slice_in_dim(x, i * (n - 1), n)[::-1],
+                        jax.lax.dynamic_slice_in_dim(y, i * (n - 1), n)[::-1],
+                        jax.lax.dynamic_slice_in_dim(yp, i * (n - 1), n)[::-1],
                     ),
                     cotangents=(
                         wx[i],
