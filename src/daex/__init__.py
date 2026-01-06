@@ -76,8 +76,10 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         x, unravel_x = ravel_pytree(x0)
         y, unravel_y = ravel_pytree(y0)
         yp, _ = ravel_pytree(yp0)
+        a, unravel_a = ravel_pytree(params)
         x_size = x.size
         y_size = y.size
+        a_size = a.size
         points = ts.shape[0]
         n_intervals = points - 1
         quad_order = self.quad_order
@@ -87,8 +89,9 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         options["algebraic_idx"] = np.arange(x_size)
 
         def deriv_fn(
-            params: Params, t: jax.Array, xarray: jax.Array, yarray: jax.Array
+            params_array: jax.Array, t: jax.Array, xarray: jax.Array, yarray: jax.Array
         ) -> jax.Array:
+            params = unravel_a(params_array)
             x = unravel_x(xarray)
             y = unravel_y(yarray)
             xy = eqx.combine(x, y)
@@ -97,8 +100,9 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             return yparray
 
         def const_fn(
-            params: Params, t: jax.Array, xarray: jax.Array, yarray: jax.Array
+            params_array: jax.Array, t: jax.Array, xarray: jax.Array, yarray: jax.Array
         ) -> jax.Array:
+            params = unravel_a(params_array)
             x = unravel_x(xarray)
             y = unravel_y(yarray)
             xy = eqx.combine(x, y)
@@ -107,58 +111,64 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             return garray
 
         def adjfn(
-            params: Params,
+            params_array: jax.Array,
             t: jax.Array,
             xarray: jax.Array,
             yarray: jax.Array,
             zarray: jax.Array,
         ):
-            dfdx, dfdy = jax.jacfwd(deriv_fn, argnums=[2, 3])(params, t, xarray, yarray)
-            dgdx, dgdy = jax.jacfwd(const_fn, argnums=[2, 3])(params, t, xarray, yarray)
+            dfdx, dfdy = jax.jacfwd(deriv_fn, argnums=[2, 3])(
+                params_array, t, xarray, yarray
+            )
+            dgdx, dgdy = jax.jacfwd(const_fn, argnums=[2, 3])(
+                params_array, t, xarray, yarray
+            )
             dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
             dz = -dfdz.T @ zarray
             return dz
 
         def deriv_adj(
-            userdata: tuple[Params, HermiteSpline], t: jax.Array, zx: PrimalDual
+            userdata: tuple[jax.Array, HermiteSpline], t: jax.Array, zx: PrimalDual
         ) -> PrimalDual:
-            params, yfunc = userdata
+            params_array, yfunc = userdata
             xarray = zx.primals
             zarray = zx.duals
             yarray = jax.lax.stop_gradient(yfunc(t))
             return PrimalDual(
                 primals=None,
-                duals=adjfn(params, t, xarray, yarray, zarray),
+                duals=adjfn(params_array, t, xarray, yarray, zarray),
             )
 
         def const_adj(
-            userdata: tuple[Params, HermiteSpline], t: jax.Array, zx: PrimalDual
+            userdata: tuple[jax.Array, HermiteSpline], t: jax.Array, zx: PrimalDual
         ) -> jax.Array:
-            params, yfunc = userdata
+            params_array, yfunc = userdata
             xarray = zx.primals
             yarray = jax.lax.stop_gradient(yfunc(t))
-            return const_fn(params, t, xarray, yarray)
+            return const_fn(params_array, t, xarray, yarray)
 
         @jax.jit
         def da_fn(
-            params: Params,
+            params_array: jax.Array,
             t: jax.Array,
             xarray: jax.Array,
             yarray: jax.Array,
             zarray: jax.Array,
         ) -> jax.Array:
-            dfda, dfdx = jax.jacrev(deriv_fn, argnums=[0, 2])(params, t, xarray, yarray)
-            dgda, dgdx = jax.jacrev(const_fn, argnums=[0, 2])(params, t, xarray, yarray)
-            lu_dgdx = jsp.linalg.lu_factor(dgdx)
-            dfda_x = jax.tree.map(
-                lambda dgda0: dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgda0), dgda
+            dfda, dfdx = jax.jacrev(deriv_fn, argnums=[0, 2])(
+                params_array, t, xarray, yarray
             )
-            da = jax.tree.map(lambda a1, a2: (a1 - a2).T @ zarray, dfda, dfda_x)
+            dgda, dgdx = jax.jacrev(const_fn, argnums=[0, 2])(
+                params_array, t, xarray, yarray
+            )
+            lu_dgdx = jsp.linalg.lu_factor(dgdx)
+            dfda_x = dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgda)
+            da = (dfda - dfda_x).T @ zarray
             return da
 
         @jax.jit
         def resfn(
-            params: Params,
+            params_array: jax.Array,
             t: jax.Array,
             y: jax.Array,
             yp: jax.Array,
@@ -166,32 +176,32 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             xarray = y[:x_size]
             yarray = y[x_size:]
             yp_est = yp[x_size:]
-            yparray = deriv_fn(params, t, xarray, yarray)
-            garray = const_fn(params, t, xarray, yarray)
+            yparray = deriv_fn(params_array, t, xarray, yarray)
+            garray = const_fn(params_array, t, xarray, yarray)
             res = jnp.concatenate([yp_est - yparray, garray])
             return res, None
 
         def resfn_wrapper(t, y, yp, res, userdata):
-            params = userdata
+            (a,) = userdata
             t = jnp.asarray(t)
             y = jnp.asarray(y)
             yp = jnp.asarray(yp)
-            res[:] = resfn(params, t, y, yp)[0]
+            res[:] = resfn(a, t, y, yp)[0]
 
         def jacfn_wrapper(t, y, yp, res, cj, JJ, userdata):
-            params = userdata
+            (a,) = userdata
             t = jnp.asarray(t)
             y = jnp.asarray(y)
             yp = jnp.asarray(yp)
-            (dy, dyp), _ = jax.jacfwd(resfn, argnums=[2, 3], has_aux=True)(
-                params, t, y, yp
-            )
+            (dy, dyp), _ = jax.jacfwd(resfn, argnums=[2, 3], has_aux=True)(a, t, y, yp)
             JJ[:, :] = dy + cj * dyp
 
-        self.options["jacfn"] = jacfn_wrapper
+        options["jacfn"] = jacfn_wrapper
 
-        def _run_forward(params: Params, ts: jax.Array, y0: jax.Array, yp0: jax.Array):
-            ida = _IDA(resfn_wrapper, userdata=params, **options)
+        def _run_forward(
+            params: jax.Array, ts: jax.Array, y0: jax.Array, yp0: jax.Array
+        ):
+            ida = _IDA(resfn_wrapper, userdata=(params,), **options)
             results = ida.solve(ts, y0, yp0)
             if not results.success:
                 raise RuntimeError(f"Adjoint IDA solver failed: {results.message}")
@@ -205,7 +215,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
 
         @jax.custom_vjp
         def dae_solve(
-            params: Params,
+            params: Float[Array, "a_size"],
             ts: Float[Array, "points"],
             x0: Float[Array, "x_size"],
             y0: Float[Array, "y_size"],
@@ -235,7 +245,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
 
         def dae_solve_fwd(
-            params: Params,
+            params: Float[Array, "a_size"],
             ts: Float[Array, "points"],
             x0: Float[Array, "x_size"],
             y0: Float[Array, "y_size"],
@@ -247,7 +257,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 Float[Array, "points y_size"],
             ],
             tuple[
-                Params,
+                Float[Array, "a_size"],
                 Float[Array, "interpolated"],
                 Float[Array, "n_intervals quad_order"],
                 Float[Array, "interpolated x_size"],
@@ -287,7 +297,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
 
         def dae_solve_bwd(
             residuals: tuple[
-                Params,
+                Float[Array, "a_size"],
                 Float[Array, "interpolated"],
                 Float[Array, "n_intervals quad_order"],
                 Float[Array, "interpolated x_size"],
@@ -300,7 +310,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 Float[Array, "points y_size"],
             ],
         ) -> tuple[
-            Params,  # parmas
+            Float[Array, "a_size"],  # parmas
             Float[Array, "points"],  # ts
             None,  # x0
             Float[Array, "y_size"],  # y0
@@ -352,7 +362,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 )
                 dJdt = dJdt.at[i].set(dJdt1 + dJdt0_prev)
                 dJdt0_prev = dJdt0
-                dJda = jax.tree.map(lambda a1, a2: a1 + a2, dJda, dJda0)
+                dJda = dJda + dJda0
                 return dJda, dJdt0_prev, dJdt, dJdy0
 
             dJda, dJdt0_prev, dJdt, dJdy0 = jax.lax.fori_loop(
@@ -360,7 +370,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 points - 1,
                 body,
                 (
-                    jax.tree.map(lambda a: jnp.zeros_like(a), params),
+                    jnp.zeros_like(params),
                     0.0,
                     jnp.zeros(points),
                     jnp.zeros_like(wy[0]),
@@ -372,7 +382,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
 
         def dae_step_bwd(
             residuals: tuple[
-                Params,
+                Float[Array, "a_size"],
                 Float[Array, "quad_order"],
                 Float[Array, "quad_order"],
                 Float[Array, "quad_order x_size"],
@@ -383,7 +393,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 Float[Array, "x_size"], Float[Array, "y_size"], Float[Array, "y_size"]
             ],
         ) -> tuple[
-            Params,  # parmas
+            Float[Array, "a_size"],  # parmas
             Float[Array, ""],  # t1
             Float[Array, ""],  # t0
             None,  # x0
@@ -419,12 +429,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 + jnp.dot(wyp, dfdt + dfdy @ yp1)
                 - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
             )
-            dJda = jax.tree.map(
-                lambda dfda0, dgda0: jnp.dot(wyp, dfda0)
-                - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda0)),
-                dfda,
-                dgda,
-            )
+            dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
 
             z1 = (
                 wy
@@ -439,7 +444,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             # jax.debug.print("Adjoint: {z}", z=z)
             # jax.debug.print("Adjoint ts: {ts}", ts=ts)
             integral = jax.vmap(da_fn, in_axes=(None, 0, 0, 0, 0))(params, ts, x, y, z)
-            dJda = jax.tree.map(lambda a1, a2: a1 + jnp.dot(ws, a2), dJda, integral)
+            dJda = dJda + jnp.dot(ws, integral)
 
             return (dJda, dJdt, -jnp.dot(z[0], yp[0]), None, z[0], None)
 
@@ -450,7 +455,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             da_fn._clear_cache()
 
         try:
-            x, y, yp = dae_solve(params, ts, x, y, yp)
+            x, y, yp = dae_solve(a, ts, x, y, yp)
         except:
             clear_cache()
             raise
