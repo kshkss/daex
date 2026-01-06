@@ -32,6 +32,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
 
     deriv_fn: Callable[[Params, jax.Array, Var], Var]
     const_fn: Callable[[Params, jax.Array, Var], Any]
+    quad_order: int
     options: dict
 
     def __init__(
