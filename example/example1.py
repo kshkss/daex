@@ -25,17 +25,16 @@ def _():
     import jax
     import jax.numpy as jnp
     import numpy as np
-    from daex import SemiExplicitDAE as IDA
+    from daex import daeint
     import equinox as eqx
     import polars as pl
     import altair as alt
     from typing import NamedTuple
-
-    return IDA, NamedTuple, alt, jax, jnp, np, pl
+    return NamedTuple, alt, daeint, jax, jnp, np, pl
 
 
 @app.cell
-def _(IDA, NamedTuple, jax, jnp):
+def _(NamedTuple, daeint, jax, jnp):
     class State(NamedTuple):
         x: jax.Array
         y: jax.Array
@@ -52,11 +51,9 @@ def _(IDA, NamedTuple, jax, jnp):
     def constraint(params: Params, t: jax.Array, stat: State) -> jax.Array:
         return stat.x ** 2 - jnp.sum(stat.y)
 
-    solver = IDA(deriv_fn=derivative, const_fn=constraint)
     params = Params(a=jnp.array(1.0))
-    u, v, clear_cache = solver.solve(params, jnp.linspace(0, 1, 11), State(y=jnp.array([2.0, 1.0]), x=jnp.sqrt(3.0)))
-    clear_cache()
-    return Params, State, params, solver, u, v
+    u, v = daeint(params, derivative, constraint, jnp.linspace(0, 1, 11), State(y=jnp.array([2.0, 1.0]), x=jnp.sqrt(3.0)))
+    return Params, State, constraint, derivative, params, u, v
 
 
 @app.cell
@@ -165,19 +162,19 @@ def _(alt, df):
 
 
 @app.cell
-def _(State, jax, jnp, params, solver):
+def _(State, constraint, daeint, derivative, jax, jnp, params):
     def loss(params, t, y0):
-        u, v, _ = solver.solve(params, t, State(y=y0, x=jnp.sqrt(jnp.sum(y0))))
+        u, v = daeint(params, derivative, constraint, t, State(y=y0, x=jnp.sqrt(jnp.sum(y0))))
         return u.y[-1, 1]
 
     jax.value_and_grad(loss, argnums=[0, 1, 2])(params, jnp.linspace(0, 1, 11), jnp.array([2.0, 1.0]))
-    return
+    return (loss,)
 
 
 @app.cell
-def _(State, jax, jnp, params, solver):
+def _(State, constraint, daeint, derivative, jax, jnp, params):
     def loss2(params, t, y0):
-        u, v, _ = solver.solve(params, t, State(y=y0, x=jnp.sqrt(jnp.sum(y0))))
+        u, v = daeint(params, derivative, constraint, t, State(y=y0, x=jnp.sqrt(jnp.sum(y0))))
         return u.x[-1]
 
     jax.value_and_grad(loss2, argnums=[0, 1, 2])(params, jnp.linspace(0, 1, 11), jnp.array([2.0, 1.0]))
@@ -185,9 +182,9 @@ def _(State, jax, jnp, params, solver):
 
 
 @app.cell
-def _(State, jax, jnp, params, solver):
+def _(State, constraint, daeint, derivative, jax, jnp, params):
     def loss3(params, t, y0):
-        u, v, _ = solver.solve(params, t, State(y=y0, x=jnp.sqrt(jnp.sum(y0))))
+        u, v = daeint(params, derivative, constraint, t, State(y=y0, x=jnp.sqrt(jnp.sum(y0))))
         return v.y[-1, 1]
 
     jax.value_and_grad(loss3, argnums=[0, 1, 2])(params, jnp.linspace(0, 1, 11), jnp.array([2.0, 1.0]))
@@ -195,7 +192,16 @@ def _(State, jax, jnp, params, solver):
 
 
 @app.cell
-def _(IDA, NamedTuple, Params, State, jax, jnp, params):
+def _(jax, jnp, loss, params):
+    def hvp(f, x, v):
+        return jax.jvp(jax.grad(f), x, v)
+
+    hvp(loss, (params, jnp.linspace(0, 1, 11), jnp.array([2.0, 1.0])), (params, jnp.linspace(0, 1, 11), jnp.array([2.0, 1.0])))
+    return
+
+
+@app.cell
+def _(NamedTuple, Params, State, daeint, jax, jnp, params):
     class _State(NamedTuple):
         y: jax.Array
 
@@ -210,13 +216,11 @@ def _(IDA, NamedTuple, Params, State, jax, jnp, params):
     def _constraint(params: Params, t: jax.Array, stat: _State) -> jax.Array:
         return None
 
-    _solver = IDA(deriv_fn=_derivative, const_fn=_constraint)
     _params = _Params(a=jnp.array(1.0))
-    _u, _v, _clear_cache = _solver.solve(params, jnp.linspace(0, 1, 11), _State(y=jnp.array([2.0, 1.0])))
-    _clear_cache()
+    _u, _v = daeint(params, _derivative, _constraint, jnp.linspace(0, 1, 11), _State(y=jnp.array([2.0, 1.0])))
 
     def _loss(params, t, y0):
-        u, v, _ = _solver.solve(params, t, _State(y=y0))
+        u, v = daeint(params, _derivative, _constraint, t, _State(y=y0))
         return u.y[-1, 1]
 
     jax.value_and_grad(_loss, argnums=[0, 1, 2])(params, jnp.linspace(0, 1, 11), jnp.array([2.0, 1.0]))
