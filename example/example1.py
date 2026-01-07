@@ -25,7 +25,7 @@ def _():
     import jax
     import jax.numpy as jnp
     import numpy as np
-    from daex import daeint
+    from daex.semi_explicit import daeint
     import equinox as eqx
     import polars as pl
     import altair as alt
