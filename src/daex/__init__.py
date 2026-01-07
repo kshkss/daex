@@ -7,7 +7,6 @@ from jax.flatten_util import ravel_pytree
 from sksundae._cy_ida import IDA as _IDA
 import equinox as eqx
 from jaxtyping import Array, Float
-import chex
 from daex.utils import HermiteSpline
 from daex import utils
 from functools import partial
