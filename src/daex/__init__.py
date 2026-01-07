@@ -517,23 +517,14 @@ def daeint[Params, Var](
         garray, _ = ravel_pytree(g)
         return garray
 
-    def clear_cache():
-        pass
-
-    try:
-        x, y, yp = _daeint(derivative, constraint, a, ts, x, y)
-    except:
-        clear_cache()
-        raise
+    x, y, yp = _daeint(derivative, constraint, a, ts, x, y)
 
     return Results(
         values=jax.vmap(lambda x, y: eqx.combine(unravel_x(x), unravel_y(y)))(x, y),
         derivatives=jax.vmap(lambda yp: unravel_y(yp))(yp),
-        clear_cache=clear_cache,
     )
 
 
 class Results[U](NamedTuple):
     values: U
     derivatives: U
-    clear_cache: Callable[[], None]
