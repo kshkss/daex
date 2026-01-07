@@ -304,6 +304,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         ]:
             """Perform the first step of DAE integration using IDA solver."""
 
+            return _call_ida(deriv_fn, const_fn, params, ts, x0, y0)
             xy = jnp.concatenate([x0, y0])
             xyp = jnp.concatenate([jnp.zeros_like(x0), yp0])
             y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
@@ -346,31 +347,11 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             chex.assert_shape(ts, (interpolated,))
             chex.assert_shape(ws, (n_intervals, quad_order))
 
-            y = jnp.concatenate([x0, y0])
-            yp = jnp.concatenate([jnp.zeros_like(x0), yp0])
-            y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(y.shape), y.dtype)
-            yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(y.shape), yp.dtype)
-
-            y, yp = jax.pure_callback(
-                _run_forward,
-                (y_type, yp_type),
-                params,
-                ts,
-                y,
-                yp,
-                vmap_method="sequential",
-            )
-            x1 = y[::3, :x_size]
-            y1 = y[::3, x_size:]
-            yp1 = yp[::3, x_size:]
-            return (x1, y1, yp1), (
-                params,
-                ts,
-                ws,
-                y[:, :x_size],
-                y[:, x_size:],
-                yp[:, x_size:],
-            )
+            x, y, yp = _call_ida(deriv_fn, const_fn, params, ts, x0, y0)
+            x1 = x[::3]
+            y1 = y[::3]
+            yp1 = yp[::3]
+            return (x1, y1, yp1), (params, ts, ws, x, y, yp)
 
         def dae_solve_bwd(
             residuals: tuple[
@@ -492,6 +473,7 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             y1 = y[-1]
             yp1 = yp[-1]
             yfunc = HermiteSpline(ts, y, yp)
+            params_array, unravel_a = ravel_pytree((params, yfunc))
 
             dgda, dgdt, dgdx, dgdy = jax.jacrev(const_fn, argnums=[0, 1, 2, 3])(
                 params, t1, x1, y1
@@ -507,19 +489,37 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
                 - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
             )
             dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
-
             z1 = (
                 wy
                 + jnp.dot(wyp, dfdy)
                 - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
             )
-            solver = SemiExplicitDAE(deriv_adj, const_adj)
-            xz, _, _ = solver.solve(
-                (params, yfunc), ts[::-1], PrimalDual(primals=x1, duals=z1)
-            )
-            z = xz.duals[::-1]
-            # jax.debug.print("Adjoint: {z}", z=z)
-            # jax.debug.print("Adjoint ts: {ts}", ts=ts)
+
+            def deriv_adj(
+                params_array: jax.Array,
+                t: jax.Array,
+                x: jax.Array,
+                z: jax.Array,
+            ):
+                params, yfunc = unravel_a(params_array)
+                y = yfunc(t)
+                # dz = dfdy - dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgdy)
+                # zp = -dz.T @ z
+                zp = adjfn(params, t, x, y, z)
+                return zp
+
+            def const_adj(
+                params_array: jax.Array,
+                t: jax.Array,
+                x: jax.Array,
+                z: jax.Array,
+            ):
+                params, yfunc = unravel_a(params_array)
+                y = yfunc(t)
+                return const_fn(params, t, x, y)
+
+            _, z, _ = _call_ida(deriv_adj, const_adj, params_array, ts[::-1], x1, z1)
+            z = z[::-1]
             integral = jax.vmap(da_fn, in_axes=(None, 0, 0, 0, 0))(params, ts, x, y, z)
             dJda = dJda + jnp.dot(ws, integral)
 
