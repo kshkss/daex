@@ -452,6 +452,88 @@ def _daeint_bwd_step(
 _daeint.defvjp(_daeint_fwd, _daeint_bwd)
 
 
+def daeint[Params, Var](
+    params: Params,
+    deriv_fn: Callable[[Params, jax.Array, Var], Var],
+    const_fn: Callable[[Params, jax.Array, Var], Any],
+    ts: Float[Array, " _"],
+    xy0: Var,
+    *,
+    quad_order=4,
+    **options,
+):
+    """
+    Interface of SUNDIALS IDA solver for systems defined as
+    explicit ODE like y' = f(t, y),
+    and semi-explicit DAE like y' = f(t, x, y), g(t, x, y) = 0.
+
+    Parameters:
+    - deriv_fn (Callable): A function that takes parameters, a coordinate `t`, and variables `x` and `y`.
+      It returns the derivative `y'` of the differential variables `y`. The parameters and variables are pytrees.
+      The return value `y'` is a pytree with the same structure as the input `x` and `y`,
+      but with `None` in the positions corresponding to the algebraic variables `x`.
+
+    - const_fn (Callable): A function that takes the same arguments as `deriv_fn` and returns the residuals
+      of the constraints for the algebraic variables. The algebraic variables are computed such that the return value
+      of `const_fn` becomes zero. If you want to solve an explicit ODE, you can pass a function that returns `None`.
+
+    - options (dict): Additional options for the solver.
+    """
+    if quad_order not in [4]:
+        raise NotImplementedError("quad_order must be 4.")
+
+    yp0 = deriv_fn(params, ts[0], xy0)
+    y0 = jax.tree.map(lambda u, v: u if v is not None else None, xy0, yp0)
+    x0 = jax.tree.map(lambda u, v: u if v is None else None, xy0, yp0)
+    try:
+        utils.assert_trees_shape_equal(y0, yp0)
+    except AssertionError as e:
+        raise ValueError(
+            "The shapes of initial conditions of differential variables and their derivative do not match. "
+            "Check the initial conditions and deriv_fn()."
+        ) from e
+    x, unravel_x = ravel_pytree(x0)
+    y, unravel_y = ravel_pytree(y0)
+    a, unravel_a = ravel_pytree(params)
+
+    def derivative(
+        params_array: jax.Array, t: jax.Array, xarray: jax.Array, yarray: jax.Array
+    ) -> jax.Array:
+        params = unravel_a(params_array)
+        x = unravel_x(xarray)
+        y = unravel_y(yarray)
+        xy = eqx.combine(x, y)
+        yp = deriv_fn(params, t, xy)
+        yparray, _ = ravel_pytree(yp)
+        return yparray
+
+    def constraint(
+        params_array: jax.Array, t: jax.Array, xarray: jax.Array, yarray: jax.Array
+    ) -> jax.Array:
+        params = unravel_a(params_array)
+        x = unravel_x(xarray)
+        y = unravel_y(yarray)
+        xy = eqx.combine(x, y)
+        g = const_fn(params, t, xy)
+        garray, _ = ravel_pytree(g)
+        return garray
+
+    def clear_cache():
+        pass
+
+    try:
+        x, y, yp = _daeint(derivative, constraint, a, ts, x, y)
+    except:
+        clear_cache()
+        raise
+
+    return Results(
+        values=jax.vmap(lambda x, y: eqx.combine(unravel_x(x), unravel_y(y)))(x, y),
+        derivatives=jax.vmap(lambda yp: unravel_y(yp))(yp),
+        clear_cache=clear_cache,
+    )
+
+
 class Results[U](NamedTuple):
     values: U
     derivatives: U
