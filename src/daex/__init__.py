@@ -210,6 +210,248 @@ def _call_ida_jvp_foreach_step(
     return (dx, dy, dyp)
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(0, 1))
+def _daeint(
+    deriv_fn: Callable,
+    const_fn: Callable,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " points"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+) -> tuple[
+    Float[Array, " x_size"],
+    Float[Array, " y_size"],
+    Float[Array, " y_size"],
+]:
+    """Perform the first step of DAE integration using IDA solver."""
+
+    return _call_ida(deriv_fn, const_fn, params, ts, x0, y0)
+
+
+def _daeint_fwd(
+    deriv_fn: Callable,
+    const_fn: Callable,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " points"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+) -> tuple[
+    tuple[
+        Float[Array, "points x_size"],
+        Float[Array, "points y_size"],
+        Float[Array, "points y_size"],
+    ],
+    tuple[
+        Float[Array, " a_size"],
+        Float[Array, " interpolated"],
+        Float[Array, "n_intervals quad_order"],
+        Float[Array, "interpolated x_size"],
+        Float[Array, "interpolated y_size"],
+        Float[Array, "interpolated y_size"],
+    ],
+]:
+    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=4)
+    x, y, yp = _call_ida(deriv_fn, const_fn, params, ts, x0, y0)
+    x1 = x[::3]
+    y1 = y[::3]
+    yp1 = yp[::3]
+    return (x1, y1, yp1), (params, ts, ws, x, y, yp)
+
+
+def _daeint_bwd(
+    deriv_fn: Callable,
+    const_fn: Callable,
+    residuals: tuple[
+        Float[Array, " a_size"],
+        Float[Array, " interpolated"],
+        Float[Array, "n_intervals quad_order"],
+        Float[Array, "interpolated x_size"],
+        Float[Array, "interpolated y_size"],
+        Float[Array, "interpolated y_size"],
+    ],
+    cotangents: tuple[
+        Float[Array, "points x_size"],
+        Float[Array, "points y_size"],
+        Float[Array, "points y_size"],
+    ],
+) -> tuple[
+    Float[Array, " a_size"],  # parmas
+    Float[Array, " points"],  # ts
+    None,  # x0
+    Float[Array, " y_size"],  # y0
+]:
+    params, ts, ws, x, y, yp = residuals
+    wx, wy, wyp = cotangents
+    ts = ts[::-1]
+    ws = ws[::-1]
+    x = x[::-1]
+    y = y[::-1]
+    yp = yp[::-1]
+    wx = wx[::-1]
+    wy = wy[::-1]
+    wyp = wyp[::-1]
+    n = 4
+    points = ts[::3].shape[0]
+
+    def adjfn(
+        params_array: jax.Array,
+        t: jax.Array,
+        xarray: jax.Array,
+        yarray: jax.Array,
+        zarray: jax.Array,
+    ):
+        dfdx, dfdy = jax.jacfwd(deriv_fn, argnums=[2, 3])(
+            params_array, t, xarray, yarray
+        )
+        dgdx, dgdy = jax.jacfwd(const_fn, argnums=[2, 3])(
+            params_array, t, xarray, yarray
+        )
+        dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
+        dz = -dfdz.T @ zarray
+        return dz
+
+    def da_fn(
+        params_array: jax.Array,
+        t: jax.Array,
+        xarray: jax.Array,
+        yarray: jax.Array,
+        zarray: jax.Array,
+    ) -> jax.Array:
+        dfda, dfdx = jax.jacrev(deriv_fn, argnums=[0, 2])(
+            params_array, t, xarray, yarray
+        )
+        dgda, dgdx = jax.jacrev(const_fn, argnums=[0, 2])(
+            params_array, t, xarray, yarray
+        )
+        lu_dgdx = jsp.linalg.lu_factor(dgdx)
+        dfda_x = dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgda)
+        da = (dfda - dfda_x).T @ zarray
+        return da
+
+    def body(i, carry):
+        dJda, dJdt0_prev, dJdt, dJdy0 = carry
+        dJda0, dJdt1, dJdt0, _, dJdy0 = _daeint_bwd_step(
+            deriv_fn,
+            const_fn,
+            adjfn,
+            da_fn,
+            residuals=(
+                params,
+                jax.lax.dynamic_slice_in_dim(ts, i * (n - 1), n)[::-1],
+                ws[i],
+                jax.lax.dynamic_slice_in_dim(x, i * (n - 1), n)[::-1],
+                jax.lax.dynamic_slice_in_dim(y, i * (n - 1), n)[::-1],
+                jax.lax.dynamic_slice_in_dim(yp, i * (n - 1), n)[::-1],
+            ),
+            cotangents=(
+                wx[i],
+                wy[i] + dJdy0,
+                wyp[i],
+            ),
+        )
+        dJdt = dJdt.at[i].set(dJdt1 + dJdt0_prev)
+        dJdt0_prev = dJdt0
+        dJda = dJda + dJda0
+        return dJda, dJdt0_prev, dJdt, dJdy0
+
+    dJda, dJdt0_prev, dJdt, dJdy0 = jax.lax.fori_loop(
+        0,
+        points - 1,
+        body,
+        (
+            jnp.zeros_like(params),
+            0.0,
+            jnp.zeros(points),
+            jnp.zeros_like(wy[0]),
+        ),
+    )
+    dJdt = dJdt.at[-1].set(dJdt0_prev)
+
+    return (dJda, dJdt[::-1], None, dJdy0)
+
+
+def _daeint_bwd_step(
+    deriv_fn: Callable,
+    const_fn: Callable,
+    adjfn: Callable,
+    da_fn: Callable,
+    residuals: tuple[
+        Float[Array, " a_size"],
+        Float[Array, " quad_order"],
+        Float[Array, " quad_order"],
+        Float[Array, "quad_order x_size"],
+        Float[Array, "quad_order y_size"],
+        Float[Array, "quad_order y_size"],
+    ],
+    cotangents: tuple[
+        Float[Array, " x_size"], Float[Array, " y_size"], Float[Array, " y_size"]
+    ],
+) -> tuple[
+    Float[Array, " a_size"],  # parmas
+    Float[Array, ""],  # t1
+    Float[Array, ""],  # t0
+    None,  # x0
+    Float[Array, " y_size"],  # y0
+]:
+    params, ts, ws, x, y, yp = residuals
+    wx, wy, wyp = cotangents
+    t1 = ts[-1]
+    x1 = x[-1]
+    y1 = y[-1]
+    yp1 = yp[-1]
+    yfunc = HermiteSpline(ts, y, yp)
+    params_array, unravel_a = ravel_pytree((params, yfunc))
+
+    dgda, dgdt, dgdx, dgdy = jax.jacrev(const_fn, argnums=[0, 1, 2, 3])(
+        params, t1, x1, y1
+    )
+    dfda, dfdt, dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[0, 1, 2, 3])(
+        params, t1, x1, y1
+    )
+    lu_dgdx = jsp.linalg.lu_factor(dgdx)
+    wxx = wx + dfdx.T @ wyp
+    dJdt = (
+        jnp.dot(wy, yp1)
+        + jnp.dot(wyp, dfdt + dfdy @ yp1)
+        - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
+    )
+    dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
+    z1 = wy + jnp.dot(wyp, dfdy) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
+
+    def deriv_adj(
+        params_array: jax.Array,
+        t: jax.Array,
+        x: jax.Array,
+        z: jax.Array,
+    ):
+        params, yfunc = unravel_a(params_array)
+        y = yfunc(t)
+        # dz = dfdy - dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgdy)
+        # zp = -dz.T @ z
+        zp = adjfn(params, t, x, y, z)
+        return zp
+
+    def const_adj(
+        params_array: jax.Array,
+        t: jax.Array,
+        x: jax.Array,
+        z: jax.Array,
+    ):
+        params, yfunc = unravel_a(params_array)
+        y = yfunc(t)
+        return const_fn(params, t, x, y)
+
+    _, z, _ = _call_ida(deriv_adj, const_adj, params_array, ts[::-1], x1, z1)
+    z = z[::-1]
+    integral = jax.vmap(da_fn, in_axes=(None, 0, 0, 0, 0))(params, ts, x, y, z)
+    dJda = dJda + jnp.dot(ws, integral)
+
+    return (dJda, dJdt, -jnp.dot(z[0], yp[0]), None, z[0])
+
+
+_daeint.defvjp(_daeint_fwd, _daeint_bwd)
+
+
 class Results[U](NamedTuple):
     values: U
     derivatives: U
@@ -301,268 +543,11 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             garray, _ = ravel_pytree(g)
             return garray
 
-        def adjfn(
-            params_array: jax.Array,
-            t: jax.Array,
-            xarray: jax.Array,
-            yarray: jax.Array,
-            zarray: jax.Array,
-        ):
-            dfdx, dfdy = jax.jacfwd(deriv_fn, argnums=[2, 3])(
-                params_array, t, xarray, yarray
-            )
-            dgdx, dgdy = jax.jacfwd(const_fn, argnums=[2, 3])(
-                params_array, t, xarray, yarray
-            )
-            dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
-            dz = -dfdz.T @ zarray
-            return dz
-
-        @jax.jit
-        def da_fn(
-            params_array: jax.Array,
-            t: jax.Array,
-            xarray: jax.Array,
-            yarray: jax.Array,
-            zarray: jax.Array,
-        ) -> jax.Array:
-            dfda, dfdx = jax.jacrev(deriv_fn, argnums=[0, 2])(
-                params_array, t, xarray, yarray
-            )
-            dgda, dgdx = jax.jacrev(const_fn, argnums=[0, 2])(
-                params_array, t, xarray, yarray
-            )
-            lu_dgdx = jsp.linalg.lu_factor(dgdx)
-            dfda_x = dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgda)
-            da = (dfda - dfda_x).T @ zarray
-            return da
-
-        @jax.custom_vjp
-        def dae_solve(
-            params: Float[Array, "a_size"],
-            ts: Float[Array, "points"],
-            x0: Float[Array, "x_size"],
-            y0: Float[Array, "y_size"],
-            yp0: Float[Array, "y_size"],
-        ) -> tuple[
-            Float[Array, "x_size"],
-            Float[Array, "y_size"],
-            Float[Array, "y_size"],
-        ]:
-            """Perform the first step of DAE integration using IDA solver."""
-
-            return _call_ida(deriv_fn, const_fn, params, ts, x0, y0)
-
-        def dae_solve_fwd(
-            params: Float[Array, "a_size"],
-            ts: Float[Array, "points"],
-            x0: Float[Array, "x_size"],
-            y0: Float[Array, "y_size"],
-            yp0: Float[Array, "y_size"],
-        ) -> tuple[
-            tuple[
-                Float[Array, "points x_size"],
-                Float[Array, "points y_size"],
-                Float[Array, "points y_size"],
-            ],
-            tuple[
-                Float[Array, "a_size"],
-                Float[Array, "interpolated"],
-                Float[Array, "n_intervals quad_order"],
-                Float[Array, "interpolated x_size"],
-                Float[Array, "interpolated y_size"],
-                Float[Array, "interpolated y_size"],
-            ],
-        ]:
-            ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=4)
-            chex.assert_shape(ts, (interpolated,))
-            chex.assert_shape(ws, (n_intervals, quad_order))
-
-            x, y, yp = _call_ida(deriv_fn, const_fn, params, ts, x0, y0)
-            x1 = x[::3]
-            y1 = y[::3]
-            yp1 = yp[::3]
-            return (x1, y1, yp1), (params, ts, ws, x, y, yp)
-
-        def dae_solve_bwd(
-            residuals: tuple[
-                Float[Array, "a_size"],
-                Float[Array, "interpolated"],
-                Float[Array, "n_intervals quad_order"],
-                Float[Array, "interpolated x_size"],
-                Float[Array, "interpolated y_size"],
-                Float[Array, "interpolated y_size"],
-            ],
-            cotangents: tuple[
-                Float[Array, "points x_size"],
-                Float[Array, "points y_size"],
-                Float[Array, "points y_size"],
-            ],
-        ) -> tuple[
-            Float[Array, "a_size"],  # parmas
-            Float[Array, "points"],  # ts
-            None,  # x0
-            Float[Array, "y_size"],  # y0
-            None,  # yp0
-        ]:
-            params, ts, ws, x, y, yp = residuals
-            wx, wy, wyp = cotangents
-            chex.assert_shape(ts, (interpolated,))
-            chex.assert_shape(ws, (n_intervals, quad_order))
-            chex.assert_shape(x, (interpolated, x_size))
-            chex.assert_shape(y, (interpolated, y_size))
-            chex.assert_shape(yp, (interpolated, y_size))
-            chex.assert_shape(wx, (points, x_size))
-            chex.assert_shape(wy, (points, y_size))
-            chex.assert_shape(wyp, (points, y_size))
-            ts = ts[::-1]
-            ws = ws[::-1]
-            x = x[::-1]
-            y = y[::-1]
-            yp = yp[::-1]
-            wx = wx[::-1]
-            wy = wy[::-1]
-            wyp = wyp[::-1]
-
-            def body(i, carry):
-                dJda, dJdt0_prev, dJdt, dJdy0 = carry
-                dJda0, dJdt1, dJdt0, _, dJdy0, _ = dae_step_bwd(
-                    residuals=(
-                        params,
-                        jax.lax.dynamic_slice_in_dim(
-                            ts, i * (quad_order - 1), quad_order
-                        )[::-1],
-                        ws[i],
-                        jax.lax.dynamic_slice_in_dim(
-                            x, i * (quad_order - 1), quad_order
-                        )[::-1],
-                        jax.lax.dynamic_slice_in_dim(
-                            y, i * (quad_order - 1), quad_order
-                        )[::-1],
-                        jax.lax.dynamic_slice_in_dim(
-                            yp, i * (quad_order - 1), quad_order
-                        )[::-1],
-                    ),
-                    cotangents=(
-                        wx[i],
-                        wy[i] + dJdy0,
-                        wyp[i],
-                    ),
-                )
-                dJdt = dJdt.at[i].set(dJdt1 + dJdt0_prev)
-                dJdt0_prev = dJdt0
-                dJda = dJda + dJda0
-                return dJda, dJdt0_prev, dJdt, dJdy0
-
-            dJda, dJdt0_prev, dJdt, dJdy0 = jax.lax.fori_loop(
-                0,
-                points - 1,
-                body,
-                (
-                    jnp.zeros_like(params),
-                    0.0,
-                    jnp.zeros(points),
-                    jnp.zeros_like(wy[0]),
-                ),
-            )
-            dJdt = dJdt.at[-1].set(dJdt0_prev)
-
-            return (dJda, dJdt[::-1], None, dJdy0, None)
-
-        def dae_step_bwd(
-            residuals: tuple[
-                Float[Array, "a_size"],
-                Float[Array, "quad_order"],
-                Float[Array, "quad_order"],
-                Float[Array, "quad_order x_size"],
-                Float[Array, "quad_order y_size"],
-                Float[Array, "quad_order y_size"],
-            ],
-            cotangents: tuple[
-                Float[Array, "x_size"], Float[Array, "y_size"], Float[Array, "y_size"]
-            ],
-        ) -> tuple[
-            Float[Array, "a_size"],  # parmas
-            Float[Array, ""],  # t1
-            Float[Array, ""],  # t0
-            None,  # x0
-            Float[Array, "y_size"],  # y0
-            None,  # yp0
-        ]:
-            params, ts, ws, x, y, yp = residuals
-            wx, wy, wyp = cotangents
-            chex.assert_shape(ts, (quad_order,))
-            chex.assert_shape(ws, (quad_order,))
-            chex.assert_shape(x, (quad_order, x_size))
-            chex.assert_shape(y, (quad_order, y_size))
-            chex.assert_shape(yp, (quad_order, y_size))
-            chex.assert_shape(wx, (x_size,))
-            chex.assert_shape(wy, (y_size,))
-            chex.assert_shape(wyp, (y_size,))
-            t1 = ts[-1]
-            x1 = x[-1]
-            y1 = y[-1]
-            yp1 = yp[-1]
-            yfunc = HermiteSpline(ts, y, yp)
-            params_array, unravel_a = ravel_pytree((params, yfunc))
-
-            dgda, dgdt, dgdx, dgdy = jax.jacrev(const_fn, argnums=[0, 1, 2, 3])(
-                params, t1, x1, y1
-            )
-            dfda, dfdt, dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[0, 1, 2, 3])(
-                params, t1, x1, y1
-            )
-            lu_dgdx = jsp.linalg.lu_factor(dgdx)
-            wxx = wx + dfdx.T @ wyp
-            dJdt = (
-                jnp.dot(wy, yp1)
-                + jnp.dot(wyp, dfdt + dfdy @ yp1)
-                - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
-            )
-            dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
-            z1 = (
-                wy
-                + jnp.dot(wyp, dfdy)
-                - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
-            )
-
-            def deriv_adj(
-                params_array: jax.Array,
-                t: jax.Array,
-                x: jax.Array,
-                z: jax.Array,
-            ):
-                params, yfunc = unravel_a(params_array)
-                y = yfunc(t)
-                # dz = dfdy - dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgdy)
-                # zp = -dz.T @ z
-                zp = adjfn(params, t, x, y, z)
-                return zp
-
-            def const_adj(
-                params_array: jax.Array,
-                t: jax.Array,
-                x: jax.Array,
-                z: jax.Array,
-            ):
-                params, yfunc = unravel_a(params_array)
-                y = yfunc(t)
-                return const_fn(params, t, x, y)
-
-            _, z, _ = _call_ida(deriv_adj, const_adj, params_array, ts[::-1], x1, z1)
-            z = z[::-1]
-            integral = jax.vmap(da_fn, in_axes=(None, 0, 0, 0, 0))(params, ts, x, y, z)
-            dJda = dJda + jnp.dot(ws, integral)
-
-            return (dJda, dJdt, -jnp.dot(z[0], yp[0]), None, z[0], None)
-
-        dae_solve.defvjp(dae_solve_fwd, dae_solve_bwd)
-
         def clear_cache():
-            da_fn._clear_cache()
+            pass
 
         try:
-            x, y, yp = dae_solve(a, ts, x, y, yp)
+            x, y, yp = _daeint(deriv_fn, const_fn, a, ts, x, y)
         except:
             clear_cache()
             raise
