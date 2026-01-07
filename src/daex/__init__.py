@@ -89,11 +89,6 @@ def _call_ida(
     return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
 
 
-class PrimalDual(NamedTuple):
-    primals: jax.Array
-    duals: jax.Array
-
-
 class Results[U](NamedTuple):
     values: U
     derivatives: U
@@ -163,8 +158,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         n_split = quad_order - 1
         interpolated = n_split * n_intervals + 1
 
-        options["algebraic_idx"] = np.arange(x_size)
-
         def deriv_fn(
             params_array: jax.Array, t: jax.Array, xarray: jax.Array, yarray: jax.Array
         ) -> jax.Array:
@@ -204,26 +197,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             dz = -dfdz.T @ zarray
             return dz
 
-        def deriv_adj(
-            userdata: tuple[jax.Array, HermiteSpline], t: jax.Array, zx: PrimalDual
-        ) -> PrimalDual:
-            params_array, yfunc = userdata
-            xarray = zx.primals
-            zarray = zx.duals
-            yarray = jax.lax.stop_gradient(yfunc(t))
-            return PrimalDual(
-                primals=None,
-                duals=adjfn(params_array, t, xarray, yarray, zarray),
-            )
-
-        def const_adj(
-            userdata: tuple[jax.Array, HermiteSpline], t: jax.Array, zx: PrimalDual
-        ) -> jax.Array:
-            params_array, yfunc = userdata
-            xarray = zx.primals
-            yarray = jax.lax.stop_gradient(yfunc(t))
-            return const_fn(params_array, t, xarray, yarray)
-
         @jax.jit
         def da_fn(
             params_array: jax.Array,
@@ -243,53 +216,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             da = (dfda - dfda_x).T @ zarray
             return da
 
-        @jax.jit
-        def resfn(
-            params_array: jax.Array,
-            t: jax.Array,
-            y: jax.Array,
-            yp: jax.Array,
-        ) -> tuple[jax.Array, None]:
-            xarray = y[:x_size]
-            yarray = y[x_size:]
-            yp_est = yp[x_size:]
-            yparray = deriv_fn(params_array, t, xarray, yarray)
-            garray = const_fn(params_array, t, xarray, yarray)
-            res = jnp.concatenate([yp_est - yparray, garray])
-            return res, None
-
-        def resfn_wrapper(t, y, yp, res, userdata):
-            (a,) = userdata
-            t = jnp.asarray(t)
-            y = jnp.asarray(y)
-            yp = jnp.asarray(yp)
-            res[:] = resfn(a, t, y, yp)[0]
-
-        def jacfn_wrapper(t, y, yp, res, cj, JJ, userdata):
-            (a,) = userdata
-            t = jnp.asarray(t)
-            y = jnp.asarray(y)
-            yp = jnp.asarray(yp)
-            (dy, dyp), _ = jax.jacfwd(resfn, argnums=[2, 3], has_aux=True)(a, t, y, yp)
-            JJ[:, :] = dy + cj * dyp
-
-        options["jacfn"] = jacfn_wrapper
-
-        def _run_forward(
-            params: jax.Array, ts: jax.Array, y0: jax.Array, yp0: jax.Array
-        ):
-            ida = _IDA(resfn_wrapper, userdata=(params,), **options)
-            results = ida.solve(ts, y0, yp0)
-            if not results.success:
-                raise RuntimeError(f"Adjoint IDA solver failed: {results.message}")
-            if ts.shape[0] == 2:
-                y = jnp.take(results.y, jnp.array([0, -1]), axis=0)
-                yp = jnp.take(results.y, jnp.array([0, -1]), axis=0)
-            else:
-                y = results.y
-                yp = results.yp
-            return y, yp
-
         @jax.custom_vjp
         def dae_solve(
             params: Float[Array, "a_size"],
@@ -305,22 +231,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
             """Perform the first step of DAE integration using IDA solver."""
 
             return _call_ida(deriv_fn, const_fn, params, ts, x0, y0)
-            xy = jnp.concatenate([x0, y0])
-            xyp = jnp.concatenate([jnp.zeros_like(x0), yp0])
-            y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
-            yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
-
-            xy, xyp = jax.pure_callback(
-                _run_forward,
-                (y_type, yp_type),
-                params,
-                ts,
-                xy,
-                xyp,
-                vmap_method="sequential",
-            )
-
-            return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
 
         def dae_solve_fwd(
             params: Float[Array, "a_size"],
@@ -528,7 +438,6 @@ class SemiExplicitDAE[Params, Var](eqx.Module):
         dae_solve.defvjp(dae_solve_fwd, dae_solve_bwd)
 
         def clear_cache():
-            resfn._clear_cache()
             da_fn._clear_cache()
 
         try:
