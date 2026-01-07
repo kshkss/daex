@@ -10,8 +10,10 @@ from jaxtyping import Array, Float
 import chex
 from daex.utils import HermiteSpline
 from daex import utils
+from functools import partial
 
 
+@partial(jax.custom_jvp, nondiff_argnums=(0, 1))
 def _call_ida(
     deriv_fn: Callable,
     const_fn: Callable,
@@ -87,6 +89,125 @@ def _call_ida(
         residual._clear_cache()
 
     return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
+
+
+@_call_ida.defjvp
+def _call_ida_jvp(deriv_fn, const_fn, primals, tangents) -> tuple:
+    params, ts, x0, y0 = primals
+    d_params, d_ts, _, dy0 = tangents
+    # x, y, yp = _call_ida(deriv_fn, const_fn, params, ts, x0, y0)
+    params_array, unravel_a = ravel_pytree((params, d_params))
+
+    yp0 = deriv_fn(params, ts[0], x0, y0)
+    z0_a = jnp.zeros_like(y0)
+    z0_y0 = dy0
+    z0_t0 = -yp0 * d_ts[0]
+
+    def deriv_ext(
+        params_array: jax.Array,
+        t: jax.Array,
+        x: jax.Array,
+        y: jax.Array,
+    ):
+        params, d_params = unravel_a(params_array)
+        y, z_a, z_y0, z_t0 = y.reshape([4, -1])
+        yp = deriv_fn(params, t, x, y)
+
+        dfda, dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[0, 2, 3])(params, t, x, y)
+        dgda, dgdx, dgdy = jax.jacrev(const_fn, argnums=[0, 2, 3])(params, t, x, y)
+        lu_dgdx = jsp.linalg.lu_factor(dgdx)
+
+        dxdz_a = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_a)
+        dxdz_y0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_y0)
+        dxdz_t0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_t0)
+        zp_a1 = dfdy @ z_a - dfdx @ dxdz_a
+        zp_y0 = dfdy @ z_y0 - dfdx @ dxdz_y0
+        zp_t0 = dfdy @ z_t0 - dfdx @ dxdz_t0
+
+        dxda = jsp.linalg.lu_solve(lu_dgdx, dgda @ d_params)
+        zp_a2 = dfda @ d_params - dfdx @ dxda
+
+        return jnp.concatenate([yp, zp_a1 + zp_a2, zp_y0, zp_t0])
+
+    def const_ext(
+        params_array: jax.Array,
+        t: jax.Array,
+        x: jax.Array,
+        y: jax.Array,
+    ):
+        params, _ = unravel_a(params_array)
+        y, _, _, _ = y.reshape([4, -1])
+        g = const_fn(params, t, x, y)
+        return g
+
+    x, y, yp = _call_ida(
+        deriv_ext,
+        const_ext,
+        params_array,
+        ts,
+        x0,
+        jnp.concatenate([y0, z0_a, z0_y0, z0_t0]),
+    )
+    y, z_a, z_y0, z_t0 = jnp.transpose(y.reshape([ts.shape[0], 4, -1]), (1, 0, 2))
+    yp, zp_a, zp_y0, zp_t0 = jnp.transpose(yp.reshape([ts.shape[0], 4, -1]), (1, 0, 2))
+    dx, dy, dyp = jax.vmap(
+        _call_ida_jvp_foreach_step,
+        in_axes=(None, None, None, None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+    )(
+        deriv_fn,
+        const_fn,
+        params,
+        d_params,
+        ts,
+        d_ts,
+        x,
+        y,
+        z_a,
+        z_y0,
+        z_t0,
+        yp,
+        zp_a,
+        zp_y0,
+        zp_t0,
+    )
+
+    return (x, y, yp), (dx, dy, dyp)
+
+
+def _call_ida_jvp_foreach_step(
+    deriv_fn,
+    const_fn,
+    params,
+    d_params,
+    t,
+    dt,
+    x,
+    y,
+    z_a,
+    z_y0,
+    z_t0,
+    yp,
+    zp_a,
+    zp_y0,
+    zp_t0,
+):
+    dfdt, dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[1, 2, 3])(params, t, x, y)
+    dgda, dgdt, dgdx, dgdy = jax.jacrev(const_fn, argnums=[0, 1, 2, 3])(params, t, x, y)
+    lu_dgdx = jsp.linalg.lu_factor(dgdx)
+
+    dy = z_a + z_y0 + z_t0 + yp * t
+    dyp = (
+        zp_a
+        + zp_y0
+        + zp_t0
+        + (dfdy @ yp + dfdt - dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp))
+        * dt
+    )
+    dx = -jsp.linalg.lu_solve(
+        lu_dgdx,
+        dgdy @ (z_a + z_y0 + z_t0) + dgda @ d_params + (dgdy @ yp + dgdt) * dt,
+    )
+    return (dx, dy, dyp)
 
 
 class Results[U](NamedTuple):
