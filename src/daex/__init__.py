@@ -12,6 +12,83 @@ from daex.utils import HermiteSpline
 from daex import utils
 
 
+def _call_ida(
+    deriv_fn: Callable,
+    const_fn: Callable,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " ticks"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+    **options,
+):
+    x_size = x0.size
+    xy = jnp.concatenate([x0, y0])
+    xyp = jnp.concatenate([jnp.zeros_like(x0), deriv_fn(params, ts[0], x0, y0)])
+    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
+    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
+
+    @jax.jit
+    def residual(params, t, xy, xyp):
+        x = xy[:x_size]
+        y = xy[x_size:]
+        yp = xyp[x_size:]
+        res = jnp.concatenate(
+            [const_fn(params, t, x, y), yp - deriv_fn(params, t, x, y)]
+        )
+        return res
+
+    def resfn(t, y, yp, res, userdata):
+        (a,) = userdata
+        t = jnp.asarray(t)
+        y = jnp.asarray(y)
+        yp = jnp.asarray(yp)
+        res[:] = np.asarray(residual(a, t, y, yp))
+
+    def jacfn(t, y, yp, res, cj, JJ, userdata):
+        (a,) = userdata
+        t = jnp.asarray(t)
+        y = jnp.asarray(y)
+        yp = jnp.asarray(yp)
+        dy, dyp = jax.jacfwd(residual, argnums=[2, 3], has_aux=False)(a, t, y, yp)
+        JJ[:, :] = np.asarray(dy + cj * dyp)
+
+    def _run_forward(
+        params: np.ndarray, ts: np.ndarray, y0: np.ndarray, yp0: np.ndarray
+    ):
+        ida = _IDA(
+            resfn,
+            jacfn=jacfn,
+            userdata=(params,),
+            algebraic_idx=np.arange(x_size),
+            **options,
+        )
+        results = ida.solve(ts, y0, yp0)
+        if not results.success:
+            raise RuntimeError(f"IDA solver failed: {results.message}")
+        if ts.shape[0] == 2:
+            y = np.take(results.y, np.array([0, -1]), axis=0)
+            yp = np.take(results.y, np.array([0, -1]), axis=0)
+        else:
+            y = results.y
+            yp = results.yp
+        return y, yp
+
+    try:
+        xy, xyp = jax.pure_callback(
+            _run_forward,
+            (y_type, yp_type),
+            params,
+            ts,
+            xy,
+            xyp,
+            vmap_method="sequential",
+        )
+    finally:
+        residual._clear_cache()
+
+    return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
+
+
 class PrimalDual(NamedTuple):
     primals: jax.Array
     duals: jax.Array
