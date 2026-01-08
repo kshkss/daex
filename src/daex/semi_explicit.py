@@ -28,7 +28,6 @@ def _call_ida(
     y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
     yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
 
-    @jax.jit
     def residual(params, t, xy, xyp):
         x = xy[:x_size]
         y = xy[x_size:]
@@ -74,18 +73,15 @@ def _call_ida(
             yp = results.yp
         return y, yp
 
-    try:
-        xy, xyp = jax.pure_callback(
-            _run_forward,
-            (y_type, yp_type),
-            params,
-            ts,
-            xy,
-            xyp,
-            vmap_method="sequential",
-        )
-    finally:
-        residual._clear_cache()
+    xy, xyp = jax.pure_callback(
+        _run_forward,
+        (y_type, yp_type),
+        params,
+        ts,
+        xy,
+        xyp,
+        vmap_method="sequential",
+    )
 
     return xy[:, :x_size], xy[:, x_size:], xyp[:, x_size:]
 
