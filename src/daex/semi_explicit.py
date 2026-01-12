@@ -139,7 +139,7 @@ def def_semi_explicit_dae[Params, Var](
         t = jnp.asarray(t)
         y = jnp.asarray(y)
         yp = jnp.asarray(yp)
-        dy, dyp = jax.jacfwd(residual, argnums=[2, 3], has_aux=False)(a, t, y, yp)
+        dy, dyp = jax.jacrev(residual, argnums=[2, 3], has_aux=False)(a, t, y, yp)
         JJ[:, :] = np.asarray(dy + cj * dyp)
 
     def deriv_ext(
@@ -203,7 +203,7 @@ def def_semi_explicit_dae[Params, Var](
         t = jnp.asarray(t)
         y = jnp.asarray(y)
         yp = jnp.asarray(yp)
-        dy, dyp = jax.jacfwd(residual_ext, argnums=[2, 3], has_aux=False)(
+        dy, dyp = jax.jacrev(residual_ext, argnums=[2, 3], has_aux=False)(
             (a, da), t, y, yp
         )
         JJ[:, :] = np.asarray(dy + cj * dyp)
@@ -271,7 +271,7 @@ def def_semi_explicit_dae[Params, Var](
         t = jnp.asarray(t)
         y = jnp.asarray(y)
         yp = jnp.asarray(yp)
-        dy, dyp = jax.jacfwd(residual_adj, argnums=[2, 3], has_aux=False)(
+        dy, dyp = jax.jacrev(residual_adj, argnums=[2, 3], has_aux=False)(
             userdata, t, y, yp
         )
         JJ[:, :] = np.asarray(dy + cj * dyp)
@@ -340,7 +340,7 @@ def def_semi_explicit_dae[Params, Var](
         t = jnp.asarray(t)
         y = jnp.asarray(y)
         yp = jnp.asarray(yp)
-        dy, dyp = jax.jacfwd(residual_adj_ext, argnums=[2, 3], has_aux=False)(
+        dy, dyp = jax.jacrev(residual_adj_ext, argnums=[2, 3], has_aux=False)(
             userdata, t, y, yp
         )
         JJ[:, :] = np.asarray(dy + cj * dyp)
