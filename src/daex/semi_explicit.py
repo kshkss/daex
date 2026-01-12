@@ -209,21 +209,24 @@ def def_semi_explicit_dae[Params, Var](
         JJ[:, :] = np.asarray(dy + cj * dyp)
 
     def da_fn(
-        params_array: jax.Array,
+        params: jax.Array,
         t: jax.Array,
-        xarray: jax.Array,
-        yarray: jax.Array,
-        zarray: jax.Array,
+        x: jax.Array,
+        y: jax.Array,
+        z: jax.Array,
     ) -> jax.Array:
-        dfda, dfdx = jax.jacrev(deriv_fn, argnums=[0, 2])(
-            params_array, t, xarray, yarray
-        )
-        dgda, dgdx = jax.jacrev(const_fn, argnums=[0, 2])(
-            params_array, t, xarray, yarray
-        )
-        lu_dgdx = jsp.linalg.lu_factor(dgdx)
-        dfda_x = dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgda)
-        da = (dfda - dfda_x).T @ zarray
+        # dfda, dfdx = jax.jacrev(deriv_fn, argnums=[0, 2])(
+        # params_array, t, xarray, yarray
+        # )
+        _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
+        zdfda, _, zdfdx, _ = vjp_deriv(z)
+        dgdx = jax.jacfwd(const_fn, argnums=2)(params, t, x, y)
+        # lu_dgdx = jsp.linalg.lu_factor(dgdx)
+        # dfda_x = dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgda)
+        zdfdg = jnp.linalg.solve(dgdx.T, zdfdx)
+        # da = (dfda - dfda_x).T @ z
+        _, vjp_const = jax.vjp(const_fn, params, t, x, y)
+        da = zdfda - vjp_const(zdfdg)[0]
         return da
 
     def deriv_adj(
