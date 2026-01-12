@@ -208,23 +208,6 @@ def def_semi_explicit_dae[Params, Var](
         )
         JJ[:, :] = np.asarray(dy + cj * dyp)
 
-    def adjfn(
-        params_array: jax.Array,
-        t: jax.Array,
-        xarray: jax.Array,
-        yarray: jax.Array,
-        zarray: jax.Array,
-    ):
-        dfdx, dfdy = jax.jacfwd(deriv_fn, argnums=[2, 3])(
-            params_array, t, xarray, yarray
-        )
-        dgdx, dgdy = jax.jacfwd(const_fn, argnums=[2, 3])(
-            params_array, t, xarray, yarray
-        )
-        dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
-        dz = -dfdz.T @ zarray
-        return dz
-
     def da_fn(
         params_array: jax.Array,
         t: jax.Array,
@@ -251,7 +234,10 @@ def def_semi_explicit_dae[Params, Var](
         yfunc: HermiteSpline,
     ):
         y = yfunc(t)
-        zp = adjfn(params, t, x, y, z)
+        dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[2, 3])(params, t, x, y)
+        dgdx, dgdy = jax.jacrev(const_fn, argnums=[2, 3])(params, t, x, y)
+        dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
+        zp = -dfdz.T @ z
         return zp
 
     def const_adj(
