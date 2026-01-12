@@ -209,21 +209,24 @@ def def_semi_explicit_dae[Params, Var](
         JJ[:, :] = np.asarray(dy + cj * dyp)
 
     def da_fn(
-        params_array: jax.Array,
+        params: jax.Array,
         t: jax.Array,
-        xarray: jax.Array,
-        yarray: jax.Array,
-        zarray: jax.Array,
+        x: jax.Array,
+        y: jax.Array,
+        z: jax.Array,
     ) -> jax.Array:
-        dfda, dfdx = jax.jacrev(deriv_fn, argnums=[0, 2])(
-            params_array, t, xarray, yarray
-        )
-        dgda, dgdx = jax.jacrev(const_fn, argnums=[0, 2])(
-            params_array, t, xarray, yarray
-        )
-        lu_dgdx = jsp.linalg.lu_factor(dgdx)
-        dfda_x = dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgda)
-        da = (dfda - dfda_x).T @ zarray
+        # dfda, dfdx = jax.jacrev(deriv_fn, argnums=[0, 2])(
+        # params_array, t, xarray, yarray
+        # )
+        _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
+        zdfda, _, zdfdx, _ = vjp_deriv(z)
+        dgdx = jax.jacfwd(const_fn, argnums=2)(params, t, x, y)
+        # lu_dgdx = jsp.linalg.lu_factor(dgdx)
+        # dfda_x = dfdx @ jsp.linalg.lu_solve(lu_dgdx, dgda)
+        zdfdg = jnp.linalg.solve(dgdx.T, zdfdx)
+        # da = (dfda - dfda_x).T @ z
+        _, vjp_const = jax.vjp(const_fn, params, t, x, y)
+        da = zdfda - vjp_const(zdfdg)[0]
         return da
 
     def deriv_adj(
@@ -234,10 +237,15 @@ def def_semi_explicit_dae[Params, Var](
         yfunc: HermiteSpline,
     ):
         y = yfunc(t)
-        dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[2, 3])(params, t, x, y)
-        dgdx, dgdy = jax.jacrev(const_fn, argnums=[2, 3])(params, t, x, y)
-        dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
-        zp = -dfdz.T @ z
+        # dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[2, 3])(params, t, x, y)
+        _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
+        _, _, zdfdx, zdfdy = vjp_deriv(z)
+        dgdx = jax.jacfwd(const_fn, argnums=2)(params, t, x, y)
+        zdfdg = jnp.linalg.solve(dgdx.T, zdfdx)
+        _, vjp_const = jax.vjp(const_fn, params, t, x, y)
+        # dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
+        # zp = -dfdz.T @ z
+        zp = -(zdfdy - vjp_const(zdfdg)[3])
         return zp
 
     def const_adj(
@@ -671,21 +679,28 @@ def _daeint_bwd_step2(
     yp1 = yp[-1]
     yfunc = HermiteSpline(ts, y, yp)
 
-    dgda, dgdt, dgdx, dgdy = jax.jacrev(callbacks.const_fn, argnums=[0, 1, 2, 3])(
-        params, t1, x1, y1
-    )
-    dfda, dfdt, dfdx, dfdy = jax.jacrev(callbacks.deriv_fn, argnums=[0, 1, 2, 3])(
-        params, t1, x1, y1
-    )
-    lu_dgdx = jsp.linalg.lu_factor(dgdx)
-    wxx = wx + dfdx.T @ wyp
+    _, vjp_const = jax.vjp(callbacks.const_fn, params, t1, x1, y1)
+    dgdt, dgdx = jax.jacfwd(callbacks.const_fn, argnums=[1, 2])(params, t1, x1, y1)
+    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
+    dfdt = jax.jacfwd(callbacks.deriv_fn, argnums=1)(params, t1, x1, y1)
+
+    wyp_a, _, wyp_x, wyp_y = vjp_deriv(wyp)
+    # lu_dgdx = jsp.linalg.lu_factor(dgdx)
+    # wxx = wx + dfdx.T @ wyp
+    wxx = wx + wyp_x
+    wx_g = jnp.linalg.solve(dgdx.T, wxx)
+    wx_g_a, _, _, wx_g_y = vjp_const(wx_g)
     dJdt = (
         jnp.dot(wy, yp1)
-        + jnp.dot(wyp, dfdt + dfdy @ yp1)
-        - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
+        # + jnp.dot(wyp, dfdt + dfdy @ yp1)
+        + jnp.dot(wyp, dfdt + vjp_deriv(yp1)[3])
+        # - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
+        - jnp.dot(wx_g, dgdt + vjp_const(yp1)[3])
     )
-    dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
-    z1 = wy + jnp.dot(wyp, dfdy) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
+    # dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
+    dJda = wyp_a - wx_g_a
+    # z1 = wy + jnp.dot(wyp, dfdy) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
+    z1 = wy + wyp_y - wx_g_y
 
     z = run_adjoint(callbacks, yfunc, params, ts, x1, z1, options)
 
