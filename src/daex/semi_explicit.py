@@ -237,10 +237,15 @@ def def_semi_explicit_dae[Params, Var](
         yfunc: HermiteSpline,
     ):
         y = yfunc(t)
-        dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[2, 3])(params, t, x, y)
-        dgdx, dgdy = jax.jacrev(const_fn, argnums=[2, 3])(params, t, x, y)
-        dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
-        zp = -dfdz.T @ z
+        # dfdx, dfdy = jax.jacrev(deriv_fn, argnums=[2, 3])(params, t, x, y)
+        _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
+        _, _, zdfdx, zdfdy = vjp_deriv(z)
+        dgdx = jax.jacfwd(const_fn, argnums=2)(params, t, x, y)
+        zdfdg = jnp.linalg.solve(dgdx.T, zdfdx)
+        _, vjp_const = jax.vjp(const_fn, params, t, x, y)
+        # dfdz = dfdy - dfdx @ jnp.linalg.solve(dgdx, dgdy)
+        # zp = -dfdz.T @ z
+        zp = -(zdfdy - vjp_const(zdfdg)[3])
         return zp
 
     def const_adj(
