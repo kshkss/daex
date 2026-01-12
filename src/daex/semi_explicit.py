@@ -339,8 +339,6 @@ def def_semi_explicit_dae[Params, Var](
             jacfn=jacfn_adj,
             userdata=params,
             algebraic_idx=np.arange(x_size),
-            calc_initcond="yp0",
-            calc_init_dt=-0.01,
         )
         results = ida.solve(ts, y0, yp0)
         if not results.success:
