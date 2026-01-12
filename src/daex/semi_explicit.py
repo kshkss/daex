@@ -679,21 +679,28 @@ def _daeint_bwd_step2(
     yp1 = yp[-1]
     yfunc = HermiteSpline(ts, y, yp)
 
-    dgda, dgdt, dgdx, dgdy = jax.jacrev(callbacks.const_fn, argnums=[0, 1, 2, 3])(
-        params, t1, x1, y1
-    )
-    dfda, dfdt, dfdx, dfdy = jax.jacrev(callbacks.deriv_fn, argnums=[0, 1, 2, 3])(
-        params, t1, x1, y1
-    )
-    lu_dgdx = jsp.linalg.lu_factor(dgdx)
-    wxx = wx + dfdx.T @ wyp
+    _, vjp_const = jax.vjp(callbacks.const_fn, params, t1, x1, y1)
+    dgdt, dgdx = jax.jacfwd(callbacks.const_fn, argnums=[1, 2])(params, t1, x1, y1)
+    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
+    dfdt = jax.jacfwd(callbacks.deriv_fn, argnums=1)(params, t1, x1, y1)
+
+    wyp_a, _, wyp_x, wyp_y = vjp_deriv(wyp)
+    # lu_dgdx = jsp.linalg.lu_factor(dgdx)
+    # wxx = wx + dfdx.T @ wyp
+    wxx = wx + wyp_x
+    wx_g = jnp.linalg.solve(dgdx.T, wxx)
+    wx_g_a, _, _, wx_g_y = vjp_const(wx_g)
     dJdt = (
         jnp.dot(wy, yp1)
-        + jnp.dot(wyp, dfdt + dfdy @ yp1)
-        - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
+        # + jnp.dot(wyp, dfdt + dfdy @ yp1)
+        + jnp.dot(wyp, dfdt + vjp_deriv(yp1)[3])
+        # - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
+        - jnp.dot(wx_g, dgdt + vjp_const(yp1)[3])
     )
-    dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
-    z1 = wy + jnp.dot(wyp, dfdy) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
+    # dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
+    dJda = wyp_a - wx_g_a
+    # z1 = wy + jnp.dot(wyp, dfdy) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
+    z1 = wy + wyp_y - wx_g_y
 
     z = run_adjoint(callbacks, yfunc, params, ts, x1, z1, options)
 
