@@ -869,7 +869,25 @@ def daeint[Params, Var](
 
     x, y, yp = _daeint2(dae, a, ts, x, y, options, options_adj)
 
+    with jax.profiler.TraceAnnotation("daeint:calc_dxdt"):
+
+        def for_each(a, t, x, y, yp):
+            dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t, x, y)
+            dxdt = -jnp.linalg.solve(
+                dgdx,
+                jax.jvp(
+                    dae.const_fn,
+                    (a, t, x, y),
+                    (jnp.zeros_like(a), jnp.ones_like(t), jnp.zeros_like(x), yp),
+                )[1],
+            )
+            return dxdt
+
+        xp = jax.vmap(for_each, in_axes=(None, 0, 0, 0, 0))(a, ts, x, y, yp)
+
     return Results(
         values=jax.vmap(lambda x, y: eqx.combine(unravel_x(x), unravel_y(y)))(x, y),
-        derivatives=jax.vmap(lambda yp: unravel_y(yp))(yp),
+        derivatives=jax.vmap(lambda xp, yp: eqx.combine(unravel_x(xp), unravel_y(yp)))(
+            xp, yp
+        ),
     )
