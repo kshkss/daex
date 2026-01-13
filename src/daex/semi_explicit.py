@@ -616,28 +616,29 @@ def _daeint_bwd2(
     points = ts[::3].shape[0]
 
     def body(i, carry):
-        dJda, dJdt0_prev, dJdt, dJdy0 = carry
-        dJda0, dJdt1, dJdt0, _, dJdy0 = _daeint_bwd_step2(
-            callbacks,
-            options_adj,
-            residuals=(
-                params,
-                jax.lax.dynamic_slice_in_dim(ts, i * (n - 1), n)[::-1],
-                ws[i],
-                jax.lax.dynamic_slice_in_dim(x, i * (n - 1), n)[::-1],
-                jax.lax.dynamic_slice_in_dim(y, i * (n - 1), n)[::-1],
-                jax.lax.dynamic_slice_in_dim(yp, i * (n - 1), n)[::-1],
-            ),
-            cotangents=(
-                wx[i],
-                wy[i] + dJdy0,
-                wyp[i],
-            ),
-        )
-        dJdt = dJdt.at[i].set(dJdt1 + dJdt0_prev)
-        dJdt0_prev = dJdt0
-        dJda = dJda + dJda0
-        return dJda, dJdt0_prev, dJdt, dJdy0
+        with jax.profiler.StepTraceAnnotation("daeint:backward_step", step_num=i):
+            dJda, dJdt0_prev, dJdt, dJdy0 = carry
+            dJda0, dJdt1, dJdt0, _, dJdy0 = _daeint_bwd_step2(
+                callbacks,
+                options_adj,
+                residuals=(
+                    params,
+                    jax.lax.dynamic_slice_in_dim(ts, i * (n - 1), n)[::-1],
+                    ws[i],
+                    jax.lax.dynamic_slice_in_dim(x, i * (n - 1), n)[::-1],
+                    jax.lax.dynamic_slice_in_dim(y, i * (n - 1), n)[::-1],
+                    jax.lax.dynamic_slice_in_dim(yp, i * (n - 1), n)[::-1],
+                ),
+                cotangents=(
+                    wx[i],
+                    wy[i] + dJdy0,
+                    wyp[i],
+                ),
+            )
+            dJdt = dJdt.at[i].set(dJdt1 + dJdt0_prev)
+            dJdt0_prev = dJdt0
+            dJda = dJda + dJda0
+            return dJda, dJdt0_prev, dJdt, dJdy0
 
     dJda, dJdt0_prev, dJdt, dJdy0 = jax.lax.fori_loop(
         0,
@@ -687,35 +688,37 @@ def _daeint_bwd_step2(
     yp1 = yp[-1]
     yfunc = HermiteSpline(ts, y, yp)
 
-    _, vjp_const = jax.vjp(callbacks.const_fn, params, t1, x1, y1)
-    dgdt, dgdx = jax.jacfwd(callbacks.const_fn, argnums=[1, 2])(params, t1, x1, y1)
-    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
-    dfdt = jax.jacfwd(callbacks.deriv_fn, argnums=1)(params, t1, x1, y1)
+    with jax.profiler.TraceAnnotation("daeint:init_adjoint"):
+        _, vjp_const = jax.vjp(callbacks.const_fn, params, t1, x1, y1)
+        dgdt, dgdx = jax.jacfwd(callbacks.const_fn, argnums=[1, 2])(params, t1, x1, y1)
+        _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
+        dfdt = jax.jacfwd(callbacks.deriv_fn, argnums=1)(params, t1, x1, y1)
 
-    wyp_a, _, wyp_x, wyp_y = vjp_deriv(wyp)
-    # lu_dgdx = jsp.linalg.lu_factor(dgdx)
-    # wxx = wx + dfdx.T @ wyp
-    wxx = wx + wyp_x
-    wx_g = jnp.linalg.solve(dgdx.T, wxx)
-    wx_g_a, _, _, wx_g_y = vjp_const(wx_g)
-    dJdt = (
-        jnp.dot(wy, yp1)
-        # + jnp.dot(wyp, dfdt + dfdy @ yp1)
-        + jnp.dot(wyp, dfdt + vjp_deriv(yp1)[3])
-        # - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
-        - jnp.dot(wx_g, dgdt + vjp_const(yp1)[3])
-    )
-    # dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
-    dJda = wyp_a - wx_g_a
-    # z1 = wy + jnp.dot(wyp, dfdy) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
-    z1 = wy + wyp_y - wx_g_y
+        wyp_a, _, wyp_x, wyp_y = vjp_deriv(wyp)
+        # lu_dgdx = jsp.linalg.lu_factor(dgdx)
+        # wxx = wx + dfdx.T @ wyp
+        wxx = wx + wyp_x
+        wx_g = jnp.linalg.solve(dgdx.T, wxx)
+        wx_g_a, _, _, wx_g_y = vjp_const(wx_g)
+        dJdt = (
+            jnp.dot(wy, yp1)
+            # + jnp.dot(wyp, dfdt + dfdy @ yp1)
+            + jnp.dot(wyp, dfdt + vjp_deriv(yp1)[3])
+            # - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
+            - jnp.dot(wx_g, dgdt + vjp_const(yp1)[3])
+        )
+        # dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
+        dJda = wyp_a - wx_g_a
+        # z1 = wy + jnp.dot(wyp, dfdy) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
+        z1 = wy + wyp_y - wx_g_y
 
     z = run_adjoint(callbacks, yfunc, params, ts, x1, z1, options)
 
-    integral = jax.vmap(callbacks.da_fn, in_axes=(None, 0, 0, 0, 0))(
-        params, ts, x, y, z
-    )
-    dJda = dJda + jnp.dot(ws, integral)
+    with jax.profiler.TraceAnnotation("daeint:integrate_da"):
+        integral = jax.vmap(callbacks.da_fn, in_axes=(None, 0, 0, 0, 0))(
+            params, ts, x, y, z
+        )
+        dJda = dJda + jnp.dot(ws, integral)
 
     return (dJda, dJdt, -jnp.dot(z[0], yp[0]), None, z[0])
 
