@@ -134,12 +134,14 @@ def def_semi_explicit_dae[Params, Var](
         yp = jnp.asarray(yp)
         res[:] = np.asarray(residual(a, t, y, yp))
 
+    jacobian = jax.jit(jax.jacrev(residual, argnums=[2, 3], has_aux=False))
+
     def jacfn(t, y, yp, res, cj, JJ, userdata):
         (a,) = userdata
         t = jnp.asarray(t)
         y = jnp.asarray(y)
         yp = jnp.asarray(yp)
-        dy, dyp = jax.jacrev(residual, argnums=[2, 3], has_aux=False)(a, t, y, yp)
+        dy, dyp = jacobian(a, t, y, yp)
         JJ[:, :] = np.asarray(dy + cj * dyp)
 
     def deriv_ext(
@@ -197,15 +199,15 @@ def def_semi_explicit_dae[Params, Var](
         yp = jnp.asarray(yp)
         res[:] = np.asarray(residual_ext((a, da), t, y, yp))
 
+    jacobian_ext = jax.jit(jax.jacrev(residual_ext, argnums=[2, 3], has_aux=False))
+
     def jacfn_ext(t, y, yp, res, cj, JJ, userdata):
         a = jnp.asarray(userdata[0])
         da = jnp.asarray(userdata[1])
         t = jnp.asarray(t)
         y = jnp.asarray(y)
         yp = jnp.asarray(yp)
-        dy, dyp = jax.jacrev(residual_ext, argnums=[2, 3], has_aux=False)(
-            (a, da), t, y, yp
-        )
+        dy, dyp = jacobian_ext((a, da), t, y, yp)
         JJ[:, :] = np.asarray(dy + cj * dyp)
 
     def da_fn(
@@ -275,13 +277,13 @@ def def_semi_explicit_dae[Params, Var](
         yp = jnp.asarray(yp)
         res[:] = np.asarray(residual_adj(userdata, t, y, yp))
 
+    jacobian_adj = jax.jit(jax.jacrev(residual_adj, argnums=[2, 3], has_aux=False))
+
     def jacfn_adj(t, y, yp, res, cj, JJ, userdata):
         t = jnp.asarray(t)
         y = jnp.asarray(y)
         yp = jnp.asarray(yp)
-        dy, dyp = jax.jacrev(residual_adj, argnums=[2, 3], has_aux=False)(
-            userdata, t, y, yp
-        )
+        dy, dyp = jacobian_adj(userdata, t, y, yp)
         JJ[:, :] = np.asarray(dy + cj * dyp)
 
     def deriv_adj_ext(
@@ -344,20 +346,26 @@ def def_semi_explicit_dae[Params, Var](
         yp = jnp.asarray(yp)
         res[:] = np.asarray(residual_adj_ext(userdata, t, y, yp))
 
+    jacobian_adj_ext = jax.jit(
+        jax.jacrev(residual_adj_ext, argnums=[2, 3], has_aux=False)
+    )
+
     def jacfn_adj_ext(t, y, yp, res, cj, JJ, userdata):
         t = jnp.asarray(t)
         y = jnp.asarray(y)
         yp = jnp.asarray(yp)
-        dy, dyp = jax.jacrev(residual_adj_ext, argnums=[2, 3], has_aux=False)(
-            userdata, t, y, yp
-        )
+        dy, dyp = jacobian_adj_ext(userdata, t, y, yp)
         JJ[:, :] = np.asarray(dy + cj * dyp)
 
     def clear_cache():
         residual._clear_cache()
+        jacobian._clear_cache()
         residual_ext._clear_cache()
+        jacobian_ext._clear_cache()
         residual_adj._clear_cache()
+        jacobian_adj._clear_cache()
         residual_adj_ext._clear_cache()
+        jacobian_adj_ext._clear_cache()
 
     return SemiExplicitDAE(
         x_size=x_size,
