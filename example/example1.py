@@ -37,7 +37,6 @@ def _():
         alt,
         daeint,
         def_semi_explicit_dae,
-        eqx,
         jax,
         jnp,
         np,
@@ -47,7 +46,7 @@ def _():
 
 
 @app.cell
-def _(NamedTuple, daeint, def_semi_explicit_dae, eqx, jax, jnp):
+def _(NamedTuple, daeint, def_semi_explicit_dae, jax, jnp):
     jax.config.update("jax_enable_x64", True)
 
     class State(NamedTuple):
@@ -74,7 +73,7 @@ def _(NamedTuple, daeint, def_semi_explicit_dae, eqx, jax, jnp):
         u = jax.vmap(result, in_axes=(None, 0, None, None))(params, ts, ts[0], stat0)
         v = jax.vmap(jax.jacfwd(result, argnums=1), in_axes=(None, 0, None, None))(params, ts, ts[0], stat0)
 
-        return u, eqx.tree_at(lambda v: v.x, v, replace=None)
+        return u, v
 
     params = Params(a=jnp.array(1.0))
     y0 = State(y=jnp.array(2.0), x=jnp.sqrt(2.0))
