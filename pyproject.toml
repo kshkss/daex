@@ -13,6 +13,7 @@ dependencies = [
     "jax>=0.8.1",
     "jaxtyping>=0.3.3",
     "scikit-sundae>=1.1.0",
+    "scipy>=1.16.3",
 ]
 
 [tool.ruff]
