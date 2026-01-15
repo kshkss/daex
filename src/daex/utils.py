@@ -4,6 +4,36 @@ import equinox as eqx
 from typing import Any, NamedTuple
 from jaxtyping import Array, Float
 import chex
+from scipy.special import roots_jacobi
+
+
+def roots_lobatto(n: int, mu: bool = False) -> tuple[jax.Array, jax.Array]:
+    """
+    ロバットノードと重みを計算
+    Args:
+        n: ノード数
+    Returns:
+        nodes: ロバットノード
+        weights: 各ノードの重み
+    """
+    if n < 2:
+        raise ValueError("n must be at least 2")
+    if n == 2:
+        nodes = jnp.array([-1.0, 1.0])
+        weights = jnp.array([1.0, 1.0])
+        return nodes, weights
+    # 内部ノードを計算
+    interior_nodes, interior_weights = roots_jacobi(n - 2, 1, 1)
+    interior_nodes = jnp.asarray(interior_nodes)
+    interior_weights = jnp.asarray(interior_weights)
+    # ロバットノードに端点を追加
+    nodes = jnp.concatenate((jnp.array([-1.0]), interior_nodes, jnp.array([1.0])))
+    # 重みを計算
+    weights = jnp.zeros(n)
+    weights = weights.at[0].set(2 / (n * (n - 1)))
+    weights = weights.at[-1].set(2 / (n * (n - 1)))
+    weights = weights.at[1:-1].set(interior_weights / (1 - interior_nodes**2))
+    return nodes, weights
 
 
 def assert_trees_shape_equal(tree1: Any, tree2: Any):  # , err_msg: str = ""):
