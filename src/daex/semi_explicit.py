@@ -413,13 +413,14 @@ def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
     return (dx, dy, dyp)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6))
+@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7))
 def _daeint2(
     callbacks: SemiExplicitDAE,
     params: Float[Array, " a_size"],
     ts: Float[Array, " points"],
     x0: Float[Array, " x_size"],
     y0: Float[Array, " y_size"],
+    quad_order: int,
     options: dict,
     options_sdj: dict,
 ) -> tuple[
@@ -439,6 +440,7 @@ def _daeint_fwd2(
     ts: Float[Array, " points"],
     x0: Float[Array, " x_size"],
     y0: Float[Array, " y_size"],
+    quad_order: int,
     options: dict,
     options_sdj: dict,
 ) -> tuple[
@@ -456,11 +458,11 @@ def _daeint_fwd2(
         Float[Array, "interpolated y_size"],
     ],
 ]:
-    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=4)
+    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=quad_order)
     x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
-    x1 = x[::3]
-    y1 = y[::3]
-    yp1 = yp[::3]
+    x1 = x[:: quad_order - 1]
+    y1 = y[:: quad_order - 1]
+    yp1 = yp[:: quad_order - 1]
     return (x1, y1, yp1), (params, ts, ws, x, y, yp)
 
 
@@ -581,6 +583,7 @@ def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents
 
 def _daeint_bwd2(
     callbacks: SemiExplicitDAE,
+    quad_order: int,
     options: dict,
     options_adj: dict,
     residuals: tuple[
@@ -612,8 +615,8 @@ def _daeint_bwd2(
     wx = wx[::-1]
     wy = wy[::-1]
     wyp = wyp[::-1]
-    n = 4
-    points = ts[::3].shape[0]
+    n = quad_order
+    points = ts[:: n - 1].shape[0]
 
     def body(i, carry):
         with jax.profiler.StepTraceAnnotation("daeint:backward_step", step_num=i):
@@ -859,15 +862,15 @@ def daeint[Params, Var](
     Args:
     - options (dict): Additional options for the solver.
     """
-    if quad_order not in [4]:
-        raise NotImplementedError("quad_order must be 4.")
+    if quad_order < 2:
+        raise NotImplementedError("quad_order must be at least 2.")
 
     x0, y0 = dae.partition(xy0)
     x, unravel_x = ravel_pytree(x0)
     y, unravel_y = ravel_pytree(y0)
     a, _ = ravel_pytree(params)
 
-    x, y, yp = _daeint2(dae, a, ts, x, y, options, options_adj)
+    x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
 
     with jax.profiler.TraceAnnotation("daeint:calc_dxdt"):
 
