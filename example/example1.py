@@ -16,7 +16,7 @@
 
 import marimo
 
-__generated_with = "0.19.2"
+__generated_with = "0.19.4"
 app = marimo.App(width="medium")
 
 
@@ -212,7 +212,7 @@ def _(alt, df):
 @app.cell
 def _(dae, daeint, jax, jnp, params, y0):
     def loss1(params, t, y0):
-        u, v = daeint(params, dae, t, y0, options_adj={"calc_initcond": "yp0", "calc_init_dt": -0.01})
+        u, v = daeint(params, dae, t, y0, quad_order=9, options_adj={"calc_initcond": "yp0", "calc_init_dt": -0.01})
         return u.y[-1]
 
     jax.grad(loss1, argnums=[0, 1, 2])(params, jnp.linspace(-0.5, 1, 11), y0)
