@@ -458,11 +458,12 @@ def _daeint_fwd2(
         Float[Array, "interpolated y_size"],
     ],
 ]:
-    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=quad_order)
+    n = (quad_order + 3) // 2
+    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
     x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
-    x1 = x[:: quad_order - 1]
-    y1 = y[:: quad_order - 1]
-    yp1 = yp[:: quad_order - 1]
+    x1 = x[:: n - 1]
+    y1 = y[:: n - 1]
+    yp1 = yp[:: n - 1]
     return (x1, y1, yp1), (params, ts, ws, x, y, yp)
 
 
@@ -615,7 +616,7 @@ def _daeint_bwd2(
     wx = wx[::-1]
     wy = wy[::-1]
     wyp = wyp[::-1]
-    n = quad_order
+    n = (quad_order + 3) // 2
     points = ts[:: n - 1].shape[0]
 
     def body(i, carry):
@@ -852,7 +853,7 @@ def daeint[Params, Var](
     ts: Float[Array, " _"],
     xy0: Var,
     *,
-    quad_order=4,
+    quad_order=5,
     options: dict = {},
     options_adj: dict = {},
 ):
@@ -862,8 +863,10 @@ def daeint[Params, Var](
     Args:
     - options (dict): Additional options for the solver.
     """
-    if quad_order < 2:
-        raise NotImplementedError("quad_order must be at least 2.")
+    if quad_order < 0:
+        raise NotImplementedError("quad_order must be positive.")
+    if quad_order % 2 == 0:
+        raise NotImplementedError("quad_order must be odd.")
 
     x0, y0 = dae.partition(xy0)
     x, unravel_x = ravel_pytree(x0)
