@@ -1,0 +1,28 @@
+{
+  "mcpServers": {
+    "code-review-graph": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "code-review-graph==2.3.7",
+        "code-review-graph",
+        "serve"
+      ],
+      "type": "stdio"
+    },
+    "better-code-review-graph": {
+      "command": "uvx",
+      "args": [
+        "--python",
+        "3.13",
+        "--from",
+        "better-code-review-graph[security]==3.21.0",
+        "better-code-review-graph"
+      ],
+      "env": {
+        "MCP_TRANSPORT": "stdio"
+      },
+      "type": "stdio"
+    }
+  }
+}

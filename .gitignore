@@ -205,3 +205,19 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# code-review-graph / better-code-review-graph
+.code-review-graph/
+*.db
+
+# Graphify
+.graphify/
+graphify-out/
+graph.html
+graph.json
+GRAPH_REPORT.md
+obsidian/
+wiki/
+
+# Serena memories（独自.gitignoreの対象外）
+.serena/memories/
