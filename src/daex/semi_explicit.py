@@ -857,7 +857,7 @@ def daeint[Params, Var](
     quad_order=5,
     options: dict = {},
     options_adj: dict = {},
-):
+) -> Results[Var]:
     """
     Interface of SUNDIALS IDA solver for systems defined as
 
