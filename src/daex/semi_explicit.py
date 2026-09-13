@@ -582,6 +582,99 @@ def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents
     return (x, y[:, 0, :], yp[:, 0, :]), (dx, dy, dyp)
 
 
+@partial(jax.custom_jvp, nondiff_argnums=(0, 5))
+def _daeint_forward(
+    callbacks: SemiExplicitDAE,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " points"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+    options: dict,
+) -> tuple[
+    Float[Array, " x_size"],
+    Float[Array, " y_size"],
+    Float[Array, " y_size"],
+]:
+    """Forward-mode-only DAE integration entry point (`mode="forward"`).
+
+    Unlike `_daeint2`, this is not wrapped in `custom_vjp`, so `jax.jvp` can
+    differentiate through it. It is the forward-mode counterpart of
+    `_daeint2`, mirroring its role as an explicit differentiation boundary.
+    """
+    return run_forward(callbacks, params, ts, x0, y0, options)
+
+
+@_daeint_forward.defjvp
+def _daeint_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
+    params, ts, x0, y0 = primals
+    d_params, d_ts, _, d_y0 = tangents
+    yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
+    z_a = jnp.zeros_like(y0)
+    z_y0 = d_y0
+    z_t0 = -yp0 * d_ts[0]
+
+    z0 = jnp.concatenate([y0, z_a, z_y0, z_t0])
+    xy = jnp.append(x0, z0)
+    xyp = jnp.append(
+        jnp.zeros_like(x0), callbacks.deriv_ext((params, d_params), ts[0], x0, z0)
+    )
+
+    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
+    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
+
+    def _call_ida(
+        params: tuple[np.ndarray, np.ndarray],
+        ts: np.ndarray,
+        y0: np.ndarray,
+        yp0: np.ndarray,
+    ):
+        ida = _IDA(
+            callbacks.resfn_ext,
+            jacfn=callbacks.jacfn_ext,
+            userdata=params,
+            algebraic_idx=np.arange(callbacks.x_size),
+            **options,
+        )
+        results = ida.solve(ts, y0, yp0)
+        if not results.success:
+            raise RuntimeError(f"IDA solver failed: {results.message}")
+        if ts.shape[0] == 2:
+            y = np.take(results.y, np.array([0, -1]), axis=0)
+            yp = np.take(results.y, np.array([0, -1]), axis=0)
+        else:
+            y = results.y
+            yp = results.yp
+        return y, yp
+
+    xy, xyp = jax.pure_callback(
+        _call_ida,
+        (y_type, yp_type),
+        (params, d_params),
+        ts,
+        xy,
+        xyp,
+        vmap_method="sequential",
+    )
+    x = xy[:, : x0.size]
+    y = xy[:, x0.size :].reshape([ts.size, 4, y0.size])
+    yp = xyp[:, x0.size :].reshape([ts.size, 4, y0.size])
+
+    dx, dy, dyp = jax.vmap(
+        _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0)
+    )(
+        callbacks.deriv_fn,
+        callbacks.const_fn,
+        params,
+        d_params,
+        ts,
+        d_ts,
+        x,
+        y,
+        yp,
+    )
+    return (x, y[:, 0, :], yp[:, 0, :]), (dx, dy, dyp)
+
+
 def _daeint_bwd2(
     callbacks: SemiExplicitDAE,
     quad_order: int,
