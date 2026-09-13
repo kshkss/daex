@@ -398,7 +398,7 @@ def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
     )
     lu_dgdx = jsp.linalg.lu_factor(dgdx)
 
-    dy = z_a + z_y0 + z_t0 + yp * t
+    dy = z_a + z_y0 + z_t0 + yp * dt
     dyp = (
         zp_a
         + zp_y0
