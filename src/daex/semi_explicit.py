@@ -941,12 +941,16 @@ def run_adjoint_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents
     return z[::-1, 0, :], dz[::-1]
 
 
+_VALID_MODES = ("forward", "reverse")
+
+
 def daeint[Params, Var](
     params: Params,
     dae: SemiExplicitDAE,
     ts: Float[Array, " _"],
     xy0: Var,
     *,
+    mode: str = "reverse",
     quad_order=5,
     options: dict = {},
     options_adj: dict = {},
@@ -956,7 +960,19 @@ def daeint[Params, Var](
 
     Args:
     - options (dict): Additional options for the solver.
+    - mode (str): Differentiation mode, one of "forward" or "reverse"
+      (default "reverse", matching the previous unconditional behavior).
+      Only first-order differentiation is guaranteed for either mode:
+      - "reverse": differentiate with `jax.grad`/`jax.vjp`.
+      - "forward": differentiate with `jax.jvp`. `quad_order` and
+        `options_adj` are unused in this mode, since there is no backward
+        (adjoint) pass.
+      Nesting differentiation transforms beyond first order (e.g.
+      `jax.grad(jax.grad(...))` or `jax.jvp(jax.jvp(...))`) is not
+      supported by either mode and will raise an error from JAX itself.
     """
+    if mode not in _VALID_MODES:
+        raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
     if quad_order < 0:
         raise NotImplementedError("quad_order must be positive.")
     if quad_order % 2 == 0:
@@ -967,7 +983,10 @@ def daeint[Params, Var](
     y, unravel_y = ravel_pytree(y0)
     a, _ = ravel_pytree(params)
 
-    x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
+    if mode == "forward":
+        x, y, yp = _daeint_forward(dae, a, ts, x, y, options)
+    else:
+        x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
 
     with jax.profiler.TraceAnnotation("daeint:calc_dxdt"):
 
