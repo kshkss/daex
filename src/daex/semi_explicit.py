@@ -467,7 +467,6 @@ def _daeint_fwd2(
     return (x1, y1, yp1), (params, ts, ws, x, y, yp)
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 5))
 def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
     yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
     xy = jnp.append(x0, y0)
@@ -509,77 +508,6 @@ def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
     yp = xyp[:, x0.size :]
 
     return x, y, yp
-
-
-@run_forward.defjvp
-def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
-    params, ts, x0, y0 = primals
-    d_params, d_ts, _, d_y0 = tangents
-    yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
-    z_a = jnp.zeros_like(y0)
-    z_y0 = d_y0
-    z_t0 = -yp0 * d_ts[0]
-
-    z0 = jnp.concatenate([y0, z_a, z_y0, z_t0])
-    xy = jnp.append(x0, z0)
-    xyp = jnp.append(
-        jnp.zeros_like(x0), callbacks.deriv_ext((params, d_params), ts[0], x0, z0)
-    )
-
-    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
-    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
-
-    def _call_ida(
-        params: tuple[np.ndarray, np.ndarray],
-        ts: np.ndarray,
-        y0: np.ndarray,
-        yp0: np.ndarray,
-    ):
-        ida = _IDA(
-            callbacks.resfn_ext,
-            jacfn=callbacks.jacfn_ext,
-            userdata=params,
-            algebraic_idx=np.arange(callbacks.x_size),
-            **options,
-        )
-        results = ida.solve(ts, y0, yp0)
-        if not results.success:
-            raise RuntimeError(f"IDA solver failed: {results.message}")
-        if ts.shape[0] == 2:
-            y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
-        else:
-            y = results.y
-            yp = results.yp
-        return y, yp
-
-    xy, xyp = jax.pure_callback(
-        _call_ida,
-        (y_type, yp_type),
-        (params, d_params),
-        ts,
-        xy,
-        xyp,
-        vmap_method="sequential",
-    )
-    x = xy[:, : x0.size]
-    y = xy[:, x0.size :].reshape([ts.size, 4, y0.size])
-    yp = xyp[:, x0.size :].reshape([ts.size, 4, y0.size])
-
-    dx, dy, dyp = jax.vmap(
-        _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0)
-    )(
-        callbacks.deriv_fn,
-        callbacks.const_fn,
-        params,
-        d_params,
-        ts,
-        d_ts,
-        x,
-        y,
-        yp,
-    )
-    return (x, y[:, 0, :], yp[:, 0, :]), (dx, dy, dyp)
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(0, 5))
@@ -821,7 +749,6 @@ def _daeint_bwd_step2(
     return (dJda, dJdt, -jnp.dot(z[0], yp[0]), None, z[0])
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 6))
 def run_adjoint(callbacks: SemiExplicitDAE, yfunc, params, ts, x1, z1, options: dict):
     zp1 = callbacks.deriv_adj(params, ts[-1], x1, z1, yfunc)
     xz = jnp.append(x1, z1)
@@ -866,79 +793,6 @@ def run_adjoint(callbacks: SemiExplicitDAE, yfunc, params, ts, x1, z1, options: 
     z = xz[:, x1.size :]
 
     return z[::-1]
-
-
-@run_adjoint.defjvp
-def run_adjoint_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
-    yfunc, params, ts, x1, y1 = primals
-    _, d_params, d_ts, _, d_y1 = tangents
-    zp1 = callbacks.deriv_adj(params, ts[-1], x1, y1, yfunc)
-    z1_a = jnp.zeros_like(y1)
-    z1_y0 = d_y1
-    z1_t0 = -zp1 * d_ts[-1]
-
-    z1 = jnp.concatenate([y1, z1_a, z1_y0, z1_t0])
-    xz = jnp.append(x1, z1)
-    xzp = jnp.append(
-        jnp.zeros_like(x1),
-        callbacks.deriv_adj_ext((params, d_params, yfunc), ts[-1], x1, z1),
-    )
-    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xz.shape), xz.dtype)
-    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xzp.shape), xzp.dtype)
-
-    def _call_ida(
-        params: tuple[np.ndarray, np.ndarray, HermiteSpline],
-        ts: np.ndarray,
-        y0: np.ndarray,
-        yp0: np.ndarray,
-    ):
-        ida = _IDA(
-            callbacks.resfn_adj_ext,
-            jacfn=callbacks.jacfn_adj_ext,
-            userdata=params,
-            algebraic_idx=np.arange(callbacks.x_size),
-            **options,
-        )
-        results = ida.solve(ts, y0, yp0)
-        if not results.success:
-            raise RuntimeError(f"IDA solver failed: {results.message}")
-        if ts.shape[0] == 2:
-            y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
-        else:
-            y = results.y
-            yp = results.yp
-        return y, yp
-
-    xz, xzp = jax.pure_callback(
-        _call_ida,
-        (y_type, yp_type),
-        (params, d_params, yfunc),
-        ts[::-1],
-        xz,
-        xzp,
-        vmap_method="sequential",
-    )
-    x = xz[:, : x1.size]
-    z = xz[:, x1.size :].reshape([ts.size, 4, y1.size])
-    zp = xzp[:, x1.size :].reshape([ts.size, 4, y1.size])
-
-    _, dz, _ = jax.vmap(
-        _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0, None)
-    )(
-        callbacks.deriv_adj,
-        callbacks.const_adj,
-        params,
-        d_params,
-        ts,
-        d_ts,
-        x,
-        z,
-        zp,
-        yfunc,
-    )
-
-    return z[::-1, 0, :], dz[::-1]
 
 
 _VALID_MODES = ("forward", "reverse")
