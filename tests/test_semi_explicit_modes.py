@@ -92,6 +92,29 @@ def test_reverse_mode_matches_analytic_gradient(dae, params, ts, y0):
     assert_allclose_tree(grad, grad_acc)
 
 
+def test_reverse_mode_gradient_includes_ts0_cotangent(dae, params, ts, y0):
+    def loss(params, ts, y0):
+        u, _ = daeint(
+            params,
+            dae,
+            ts,
+            y0,
+            mode="reverse",
+            quad_order=9,
+            options_adj={"calc_initcond": "yp0", "calc_init_dt": -0.01},
+        )
+        return jnp.sum(u.y)
+
+    grad_y0 = jax.grad(loss, argnums=2)(params, ts, y0)
+
+    eps = 1e-6
+    y0_plus = State(x=y0.x, y=y0.y + eps)
+    y0_minus = State(x=y0.x, y=y0.y - eps)
+    fd_y0 = (loss(params, ts, y0_plus) - loss(params, ts, y0_minus)) / (2 * eps)
+
+    assert jnp.allclose(grad_y0.y, fd_y0, 1e-3, 1e-3)
+
+
 def test_default_mode_is_reverse(dae, params, ts, y0):
     def loss_default(params, ts, y0):
         u, _ = daeint(params, dae, ts, y0)
