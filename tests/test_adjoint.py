@@ -67,10 +67,10 @@ def test_adjoint_matches_finite_difference_with_cotangent_at_every_point(
     dae, params, ts, y0
 ):
     def loss(params, ts, y0):
-        u, _ = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
+        u, _ = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
         return jnp.sum(u.y)
 
-    result = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
+    result = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
     cotangent = State(
         x=jnp.zeros_like(result.values.x), y=jnp.ones_like(result.values.y)
     )
@@ -88,15 +88,15 @@ def test_adjoint_matches_finite_difference_with_cotangent_at_every_point(
     )
 
     fd = finite_diff_grad_y(loss, params, ts, y0)
-    assert jnp.allclose(z.nu.y, fd, 1e-3, 1e-3)
+    assert jnp.allclose(z.initial_value.y, fd, 1e-3, 1e-3)
 
 
 def test_adjoint_matches_finite_difference_with_terminal_cotangent(dae, params, ts, y0):
     def loss(params, ts, y0):
-        u, _ = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
+        u, _ = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
         return u.y[-1]
 
-    result = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
+    result = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
     cotangent = State(
         x=jnp.zeros_like(result.values.x),
         y=jnp.zeros_like(result.values.y).at[-1].set(1.0),
@@ -115,11 +115,11 @@ def test_adjoint_matches_finite_difference_with_terminal_cotangent(dae, params, 
     )
 
     fd = finite_diff_grad_y(loss, params, ts, y0)
-    assert jnp.allclose(z.nu.y, fd, 1e-3, 1e-3)
+    assert jnp.allclose(z.initial_value.y, fd, 1e-3, 1e-3)
 
 
 def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
-    result = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
+    result = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
     cotangent = State(
         x=jnp.zeros_like(result.values.x),
         y=jnp.zeros_like(result.values.y).at[-1].set(1.0),
@@ -138,9 +138,8 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
     )
 
     # lam only populates the differential (y) part; mu only the algebraic (x) part.
-    assert out.lam.x is None
-    assert out.mu.y is None
-    assert jnp.allclose(out.nu.y, out.lam.y[0])
+    assert out.derivative.x is None
+    assert jnp.allclose(out.initial_value.y, out.derivative.y[0])
 
     # mu(t) should be recoverable purely from lam(t) and the forward solution,
     # by re-deriving the same algebraic relation used inside deriv_adj/da_fn.
@@ -154,24 +153,24 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
         dae.partition(jax.tree.map(lambda leaf: leaf[i], result.values))[1]
     )
     lam1, _ = ravel_pytree(
-        dae.partition(jax.tree.map(lambda leaf: leaf[i], out.lam))[1]
+        dae.partition(jax.tree.map(lambda leaf: leaf[i], out.derivative))[1]
     )
 
     _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t, x1, y1)
     _, _, zdfdx, _ = vjp_deriv(lam1)
     dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t, x1, y1)
     expected_mu, _ = ravel_pytree(
-        dae.partition(jax.tree.map(lambda leaf: leaf[i], out.mu))[0]
+        dae.partition(jax.tree.map(lambda leaf: leaf[i], out.constraint))[0]
     )
     assert jnp.allclose(expected_mu, jnp.linalg.solve(dgdx.T, zdfdx))
 
 
 def test_adjoint_matches_finite_difference_with_interior_cotangent(dae, params, ts, y0):
     def loss(params, ts, y0):
-        u, _ = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
+        u, _ = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
         return u.y[5]
 
-    result = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
+    result = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
     cotangent = State(
         x=jnp.zeros_like(result.values.x),
         y=jnp.zeros_like(result.values.y).at[5].set(1.0),
@@ -190,4 +189,4 @@ def test_adjoint_matches_finite_difference_with_interior_cotangent(dae, params, 
     )
 
     fd = finite_diff_grad_y(loss, params, ts, y0)
-    assert jnp.allclose(z.nu.y, fd, 1e-3, 1e-3)
+    assert jnp.allclose(z.initial_value.y, fd, 1e-3, 1e-3)
