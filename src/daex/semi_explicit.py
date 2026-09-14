@@ -656,6 +656,7 @@ def _daeint_bwd2(
         ),
     )
     dJdt = dJdt.at[-1].set(dJdt0_prev)
+    dJdy0 = dJdy0 + wy[-1]
 
     return (dJda, dJdt[::-1], None, dJdy0)
 
