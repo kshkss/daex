@@ -898,3 +898,118 @@ def daeint[Params, Var](
             xp, yp
         ),
     )
+
+
+class AdjointResult[Var](NamedTuple):
+    derivative: Var
+    constraint: Float[jax.Array, " constraints"]
+    initial_value: Var
+
+
+def adjoint[Params, Var](
+    params: Params,
+    dae: SemiExplicitDAE,
+    ts: Float[Array, " points"],
+    solution: Results[Var],
+    cotangent: Results[Var],
+    *,
+    options: dict = {},
+) -> AdjointResult[Var]:
+    """
+    Compute the adjoint trajectory of a semi-explicit DAE.
+
+    Given the equation system, a forward solution trajectory sampled at
+    `ts`, and cotangents matching that trajectory (one entry per point,
+    as in reverse-mode automatic differentiation), integrate the adjoint
+    DAE backward and return:
+
+    - `lam`: the costate lambda(t) for the differential variables `y`, at
+      every point of `ts`. At each point, `lam` already includes that
+      point's own cotangent contribution.
+    - `mu`: the Lagrange multiplier mu(t) of the algebraic constraint
+      `g(t, x, y) = 0`, at every point of `ts`, recomputed from `lam` and
+      the forward solution (mu is not carried as persistent DAE state; it
+      is an algebraic byproduct of lambda at each instant).
+    - `nu`: the Lagrange multiplier of the initial condition `y(0) = y0`,
+      i.e. `lam` at `ts[0]`. It equals the gradient of the loss with
+      respect to the initial condition `y0` that would be obtained by
+      differentiating `daeint` in `mode="reverse"`.
+
+    Args:
+    - params (Params): Parameters, as passed to `daeint`.
+    - dae (SemiExplicitDAE): The equation system, as returned by
+      `def_semi_explicit_dae`.
+    - ts (Array): Coordinates at which `solution`/`cotangent` are sampled.
+    - solution (Results[Var]): The forward solution.
+    - cotangent (Results[Var]): Cotangent matching `solution`.
+    - options (dict): Additional options for the backward IDA solver,
+      passed through to the adjoint DAE integration.
+    """
+    solution_values, solution_derivative = solution
+    cotangent_values, cotangent_derivative = cotangent
+    a, _ = ravel_pytree(params)
+
+    x0_sample, y0_sample = dae.partition(
+        jax.tree.map(lambda leaf: leaf[0], solution_values)
+    )
+    _, unravel_x = ravel_pytree(x0_sample)
+    _, unravel_y = ravel_pytree(y0_sample)
+
+    def ravel_xy(xy: Var) -> tuple[jax.Array, jax.Array]:
+        x0, y0 = dae.partition(xy)
+        xarray, _ = ravel_pytree(x0)
+        yarray, _ = ravel_pytree(y0)
+        return xarray, yarray
+
+    x, y = jax.vmap(ravel_xy)(solution_values)
+    _, yp = jax.vmap(ravel_xy)(solution_derivative)
+    wx, wy = jax.vmap(ravel_xy)(cotangent_values)
+    _, wyp = jax.vmap(ravel_xy)(cotangent_derivative)
+
+    points = ts.shape[0]
+    ts_r = ts[::-1]
+    x_r = x[::-1]
+    y_r = y[::-1]
+    yp_r = yp[::-1]
+    wx_r = wx[::-1]
+    wy_r = wy[::-1]
+    wyp_r = wyp[::-1]
+
+    def own_contribution(t1, x1, y1, wx1, wy1, wyp1):
+        _, vjp_const = jax.vjp(dae.const_fn, a, t1, x1, y1)
+        dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t1, x1, y1)
+        _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t1, x1, y1)
+
+        _, _, wyp_x, wyp_y = vjp_deriv(wyp1)
+        wx_g = jnp.linalg.solve(dgdx.T, wx1 + wyp_x)
+        _, _, _, wx_g_y = vjp_const(wx_g)
+        return wy1 + wyp_y - wx_g_y
+
+    z0 = own_contribution(ts_r[0], x_r[0], y_r[0], wx_r[0], wy_r[0], wyp_r[0])
+    z_r = jnp.zeros((points, z0.size)).at[0].set(z0)
+
+    def body(i, z_r):
+        interval_ts = jnp.stack([ts_r[i], ts_r[i - 1]])
+        interval_y = jnp.stack([y_r[i], y_r[i - 1]])
+        interval_yp = jnp.stack([yp_r[i], yp_r[i - 1]])
+        yfunc = HermiteSpline(interval_ts, interval_y, interval_yp)
+        z = run_adjoint(dae, yfunc, a, interval_ts, x_r[i - 1], z_r[i - 1], options)
+        z_own = own_contribution(ts_r[i], x_r[i], y_r[i], wx_r[i], wy_r[i], wyp_r[i])
+        return z_r.at[i].set(z_own + z[0])
+
+    z_r = jax.lax.fori_loop(1, points, body, z_r)
+    lam = z_r[::-1]
+
+    def compute_mu(t, x1, y1, lam1):
+        _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t, x1, y1)
+        _, _, zdfdx, _ = vjp_deriv(lam1)
+        dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t, x1, y1)
+        return jnp.linalg.solve(dgdx.T, zdfdx)
+
+    mu = jax.vmap(compute_mu)(ts, x, y, lam)
+
+    lam_var = jax.vmap(unravel_y)(lam)
+    mu_var = jax.vmap(unravel_x)(mu)
+    nu_var = jax.tree.map(lambda leaf: leaf[0], lam_var)
+
+    return AdjointResult(derivative=lam_var, constraint=mu_var, initial_value=nu_var)
