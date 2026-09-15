@@ -430,7 +430,7 @@ def _daeint2(
 ]:
     """Perform DAE integration using IDA."""
 
-    x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
+    x, y, yp = _run_forward(callbacks, params, ts, x0, y0, options)
     return x, y, yp
 
 
@@ -460,7 +460,7 @@ def _daeint_fwd2(
 ]:
     n = (quad_order + 3) // 2
     ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
-    x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
+    x, y, yp = _run_forward(callbacks, params, ts, x0, y0, options)
     x1 = x[:: n - 1]
     y1 = y[:: n - 1]
     yp1 = yp[:: n - 1]
@@ -468,7 +468,7 @@ def _daeint_fwd2(
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(0, 5))
-def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
+def _run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
     """Forward-mode-only DAE integration entry point (`mode="forward"`).
 
     Unlike `_daeint2`, this is not wrapped in `custom_vjp`, so `jax.jvp` can
@@ -517,8 +517,8 @@ def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
     return x, y, yp
 
 
-@run_forward.defjvp
-def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
+@_run_forward.defjvp
+def _run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
     yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
@@ -823,7 +823,7 @@ def daeint[Params, Var](
     a, _ = ravel_pytree(params)
 
     if mode == "forward":
-        x, y, yp = run_forward(dae, a, ts, x, y, options)
+        x, y, yp = _run_forward(dae, a, ts, x, y, options)
     else:
         x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
 
