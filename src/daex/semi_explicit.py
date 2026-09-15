@@ -467,7 +467,14 @@ def _daeint_fwd2(
     return (x1, y1, yp1), (params, ts, ws, x, y, yp)
 
 
+@partial(jax.custom_jvp, nondiff_argnums=(0, 5))
 def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
+    """Forward-mode-only DAE integration entry point (`mode="forward"`).
+
+    Unlike `_daeint2`, this is not wrapped in `custom_vjp`, so `jax.jvp` can
+    differentiate through it. It is the forward-mode counterpart of
+    `_daeint2`, mirroring its role as an explicit differentiation boundary.
+    """
     yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
     xy = jnp.append(x0, y0)
     xyp = jnp.append(jnp.zeros_like(x0), yp0)
@@ -510,30 +517,8 @@ def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
     return x, y, yp
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 5))
-def _daeint_forward(
-    callbacks: SemiExplicitDAE,
-    params: Float[Array, " a_size"],
-    ts: Float[Array, " points"],
-    x0: Float[Array, " x_size"],
-    y0: Float[Array, " y_size"],
-    options: dict,
-) -> tuple[
-    Float[Array, " x_size"],
-    Float[Array, " y_size"],
-    Float[Array, " y_size"],
-]:
-    """Forward-mode-only DAE integration entry point (`mode="forward"`).
-
-    Unlike `_daeint2`, this is not wrapped in `custom_vjp`, so `jax.jvp` can
-    differentiate through it. It is the forward-mode counterpart of
-    `_daeint2`, mirroring its role as an explicit differentiation boundary.
-    """
-    return run_forward(callbacks, params, ts, x0, y0, options)
-
-
-@_daeint_forward.defjvp
-def _daeint_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
+@run_forward.defjvp
+def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
     yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
@@ -838,7 +823,7 @@ def daeint[Params, Var](
     a, _ = ravel_pytree(params)
 
     if mode == "forward":
-        x, y, yp = _daeint_forward(dae, a, ts, x, y, options)
+        x, y, yp = run_forward(dae, a, ts, x, y, options)
     else:
         x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
 
