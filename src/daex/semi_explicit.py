@@ -525,52 +525,54 @@ def _run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangent
     z_a = jnp.zeros_like(y0)
     z_y0 = d_y0
     z_t0 = -yp0 * d_ts[0]
-
     z0 = jnp.concatenate([y0, z_a, z_y0, z_t0])
-    xy = jnp.append(x0, z0)
-    xyp = jnp.append(
-        jnp.zeros_like(x0), callbacks.deriv_ext((params, d_params), ts[0], x0, z0)
-    )
 
-    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
-    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
+    def sens_derivative(params_dparams, t, xz):
+        params, d_params = params_dparams
+        x, z = xz
+        y, z_a, z_y0, z_t0 = z.reshape([4, -1])
+        yp = callbacks.deriv_fn(params, t, x, y)
 
-    def _call_ida(
-        params: tuple[np.ndarray, np.ndarray],
-        ts: np.ndarray,
-        y0: np.ndarray,
-        yp0: np.ndarray,
-    ):
-        ida = _IDA(
-            callbacks.resfn_ext,
-            jacfn=callbacks.jacfn_ext,
-            userdata=params,
-            algebraic_idx=np.arange(callbacks.x_size),
-            **options,
+        dfda, dfdx, dfdy = jax.jacrev(callbacks.deriv_fn, argnums=[0, 2, 3])(
+            params, t, x, y
         )
-        results = ida.solve(ts, y0, yp0)
-        if not results.success:
-            raise RuntimeError(f"IDA solver failed: {results.message}")
-        if ts.shape[0] == 2:
-            y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
-        else:
-            y = results.y
-            yp = results.yp
-        return y, yp
+        dgda, dgdx, dgdy = jax.jacrev(callbacks.const_fn, argnums=[0, 2, 3])(
+            params, t, x, y
+        )
+        lu_dgdx = jsp.linalg.lu_factor(dgdx)
 
-    xy, xyp = jax.pure_callback(
-        _call_ida,
-        (y_type, yp_type),
+        dxdz_a = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_a)
+        dxdz_y0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_y0)
+        dxdz_t0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_t0)
+        zp_a1 = dfdy @ z_a - dfdx @ dxdz_a
+        zp_y0 = dfdy @ z_y0 - dfdx @ dxdz_y0
+        zp_t0 = dfdy @ z_t0 - dfdx @ dxdz_t0
+
+        dxda = jsp.linalg.lu_solve(lu_dgdx, dgda @ d_params)
+        zp_a2 = dfda @ d_params - dfdx @ dxda
+
+        zp = jnp.concatenate([yp, zp_a1 + zp_a2, zp_y0, zp_t0])
+        return None, zp
+
+    def sens_constraint(params_dparams, t, xz):
+        params, _ = params_dparams
+        x, z = xz
+        y, _, _, _ = z.reshape([4, -1])
+        return callbacks.const_fn(params, t, x, y)
+
+    sens_dae = def_semi_explicit_dae(
+        sens_derivative,
+        sens_constraint,
         (params, d_params),
-        ts,
-        xy,
-        xyp,
-        vmap_method="sequential",
+        ts[0],
+        (x0, z0),
     )
-    x = xy[:, : x0.size]
-    y = xy[:, x0.size :].reshape([ts.size, 4, y0.size])
-    yp = xyp[:, x0.size :].reshape([ts.size, 4, y0.size])
+    a_dparams, _ = ravel_pytree((params, d_params))
+
+    x, y, yp = _run_forward(sens_dae, a_dparams, ts, x0, z0, options)
+
+    y = y.reshape([ts.size, 4, y0.size])
+    yp = yp.reshape([ts.size, 4, y0.size])
 
     dx, dy, dyp = jax.vmap(
         _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0)
