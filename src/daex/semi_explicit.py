@@ -803,14 +803,21 @@ def daeint[Params, Var](
     - options (dict): Additional options for the solver.
     - mode (str): Differentiation mode, one of "forward" or "reverse"
       (default "reverse", matching the previous unconditional behavior).
-      Only first-order differentiation is guaranteed for either mode:
-      - "reverse": differentiate with `jax.grad`/`jax.vjp`.
+      Only first-order differentiation is guaranteed for "reverse":
+      - "reverse": differentiate with `jax.grad`/`jax.vjp`. Nesting
+        differentiation transforms beyond first order (e.g.
+        `jax.grad(jax.grad(...))`) is not supported and will raise an
+        error from JAX itself, since it goes through `jax.pure_callback`
+        directly, which has no differentiation rule of its own.
       - "forward": differentiate with `jax.jvp`. `quad_order` and
         `options_adj` are unused in this mode, since there is no backward
-        (adjoint) pass.
-      Nesting differentiation transforms beyond first order (e.g.
-      `jax.grad(jax.grad(...))` or `jax.jvp(jax.jvp(...))`) is not
-      supported by either mode and will raise an error from JAX itself.
+        (adjoint) pass. Unlike "reverse", second-order forward-over-forward
+        differentiation (`jax.jvp(jax.jvp(...))`, or equivalently
+        `jax.jacfwd(jax.jacfwd(...))`) is supported and tested (see
+        `tests/test_forward_mode_*.py`), since the JVP rule integrates the
+        sensitivity DAE through `_run_forward` itself rather than through a
+        raw `jax.pure_callback`. Differentiation transforms beyond second
+        order are untested and not guaranteed.
     """
     if mode not in _VALID_MODES:
         raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
