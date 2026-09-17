@@ -923,17 +923,33 @@ def adjoint[Params, Var](
     as in reverse-mode automatic differentiation), integrate the adjoint
     DAE backward and return:
 
-    - `lam`: the costate lambda(t) for the differential variables `y`, at
-      every point of `ts`. At each point, `lam` already includes that
-      point's own cotangent contribution.
+    - `lam`: the continuous-adjoint costate lambda(t) for the differential
+      variables `y`. Because the loss can depend on the forward solution
+      at any point of `ts`, lambda(t) generally has a jump discontinuity
+      exactly at each interior point of `ts` (of size equal to that
+      point's own cotangent contribution), so a single value per `ts`
+      point cannot represent it faithfully. Instead, `lam` has shape
+      `(len(ts) - 1, 2, ...)`: for the `k`-th forward integration
+      interval, covering `[ts[k], ts[k+1]]`, `lam[k, 0]` is
+      `lambda(ts[k]+)` (the value as the continuous trajectory enters the
+      interval from `ts[k]`, i.e. the limit approached from later times
+      during backward integration, *before* `ts[k]`'s own jump) and
+      `lam[k, 1]` is `lambda(ts[k+1]-)` (the value as it reaches
+      `ts[k+1]`, *after* `ts[k+1]`'s own jump has been folded in -- this
+      is exactly the value that seeds backward integration of the next,
+      earlier interval).
     - `mu`: the Lagrange multiplier mu(t) of the algebraic constraint
-      `g(t, x, y) = 0`, at every point of `ts`, recomputed from `lam` and
-      the forward solution (mu is not carried as persistent DAE state; it
-      is an algebraic byproduct of lambda at each instant).
+      `g(t, x, y) = 0`, recomputed from `lam` and the forward solution
+      (mu is not carried as persistent DAE state; it is an algebraic
+      byproduct of lambda at each instant). Since mu(t) is a pointwise
+      linear function of lambda(t), it inherits lambda's jump and shares
+      its shape: `mu[k, 0]`/`mu[k, 1]` are recomputed from `lam[k,
+      0]`/`lam[k, 1]` respectively.
     - `nu`: the Lagrange multiplier of the initial condition `y(0) = y0`,
-      i.e. `lam` at `ts[0]`. It equals the gradient of the loss with
-      respect to the initial condition `y0` that would be obtained by
-      differentiating `daeint` in `mode="reverse"`.
+      i.e. `lambda(ts[0]-)`. Unlike `lam`/`mu`, this remains a single
+      value (there is no "before `ts[0]`" side). It equals the gradient
+      of the loss with respect to the initial condition `y0` that would
+      be obtained by differentiating `daeint` in `mode="reverse"`.
 
     Args:
     - params (Params): Parameters, as passed to `daeint`.
@@ -986,19 +1002,28 @@ def adjoint[Params, Var](
         return wy1 + wyp_y - wx_g_y
 
     z0 = own_contribution(ts_r[0], x_r[0], y_r[0], wx_r[0], wy_r[0], wyp_r[0])
-    z_r = jnp.zeros((points, z0.size)).at[0].set(z0)
+    z_post_r = jnp.zeros((points, z0.size)).at[0].set(z0)
+    z_pre_r = jnp.zeros((points, z0.size)).at[0].set(z0)  # index 0 unused
 
-    def body(i, z_r):
+    def body(i, carry):
+        z_post_r, z_pre_r = carry
         interval_ts = jnp.stack([ts_r[i], ts_r[i - 1]])
         interval_y = jnp.stack([y_r[i], y_r[i - 1]])
         interval_yp = jnp.stack([yp_r[i], yp_r[i - 1]])
         yfunc = HermiteSpline(interval_ts, interval_y, interval_yp)
-        z = run_adjoint(dae, yfunc, a, interval_ts, x_r[i - 1], z_r[i - 1], options)
+        z = run_adjoint(
+            dae, yfunc, a, interval_ts, x_r[i - 1], z_post_r[i - 1], options
+        )
         z_own = own_contribution(ts_r[i], x_r[i], y_r[i], wx_r[i], wy_r[i], wyp_r[i])
-        return z_r.at[i].set(z_own + z[0])
+        z_pre_r = z_pre_r.at[i].set(z[0])
+        z_post_r = z_post_r.at[i].set(z_own + z[0])
+        return z_post_r, z_pre_r
 
-    z_r = jax.lax.fori_loop(1, points, body, z_r)
-    lam = z_r[::-1]
+    z_post_r, z_pre_r = jax.lax.fori_loop(1, points, body, (z_post_r, z_pre_r))
+    lam_post = z_post_r[::-1]  # lam_post[k] = lambda(ts[k]-); lam_post[-1] = z0
+    lam_pre = z_pre_r[::-1]  # lam_pre[k] = lambda(ts[k]+), meaningful for k < points-1
+
+    interval_lam = jnp.stack([lam_pre[:-1], lam_post[1:]], axis=1)
 
     def compute_mu(t, x1, y1, lam1):
         _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t, x1, y1)
@@ -1006,10 +1031,12 @@ def adjoint[Params, Var](
         dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t, x1, y1)
         return jnp.linalg.solve(dgdx.T, zdfdx)
 
-    mu = jax.vmap(compute_mu)(ts, x, y, lam)
+    mu_pre = jax.vmap(compute_mu)(ts, x, y, lam_pre)
+    mu_post = jax.vmap(compute_mu)(ts, x, y, lam_post)
+    interval_mu = jnp.stack([mu_pre[:-1], mu_post[1:]], axis=1)
 
-    lam_var = jax.vmap(unravel_y)(lam)
-    mu_var = jax.vmap(unravel_x)(mu)
-    nu_var = jax.tree.map(lambda leaf: leaf[0], lam_var)
+    lam_var = jax.vmap(jax.vmap(unravel_y))(interval_lam)
+    mu_var = jax.vmap(jax.vmap(unravel_x))(interval_mu)
+    nu_var = unravel_y(lam_post[0])
 
     return AdjointResult(derivative=lam_var, constraint=mu_var, initial_value=nu_var)
