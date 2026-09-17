@@ -216,3 +216,45 @@ def test_adjoint_matches_finite_difference_with_interior_cotangent(dae, params, 
 
     fd = finite_diff_grad_y(loss, params, ts, y0)
     assert jnp.allclose(z.initial_value.y, fd, 1e-3, 1e-3)
+
+    # The cotangent is injected only at ts[5], so the continuous adjoint
+    # must have a genuine jump discontinuity exactly there, of size equal
+    # to that point's own cotangent contribution. A regression that
+    # duplicated the post-jump value into both sides (discarding
+    # lambda(ts[k]+)) would make this difference zero instead.
+    jump = z.derivative.y[4, 1] - z.derivative.y[5, 0]
+    assert jnp.allclose(jump, cotangent.y[5], 1e-6, 1e-6)
+
+    # mu is recomputed pointwise from lambda, so validate BOTH sides at
+    # ts[5] independently against the manual algebraic formula (reused
+    # from test_adjoint_mu_is_recomputed_from_lambda), and confirm they
+    # differ -- i.e. the constraint sides carry the same jump information,
+    # not just the costate.
+    a, _ = ravel_pytree(params)
+    t5 = ts[5]
+    x5, _ = ravel_pytree(
+        dae.partition(jax.tree.map(lambda leaf: leaf[5], result.values))[0]
+    )
+    y5, _ = ravel_pytree(
+        dae.partition(jax.tree.map(lambda leaf: leaf[5], result.values))[1]
+    )
+
+    def expected_mu(lam_var):
+        lam1, _ = ravel_pytree(dae.partition(lam_var)[1])
+        _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t5, x5, y5)
+        _, _, zdfdx, _ = vjp_deriv(lam1)
+        dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t5, x5, y5)
+        return jnp.linalg.solve(dgdx.T, zdfdx)
+
+    def actual_mu(constraint_var):
+        mu1, _ = ravel_pytree(dae.partition(constraint_var)[0])
+        return mu1
+
+    lam_pre_5 = jax.tree.map(lambda leaf: leaf[5, 0], z.derivative)
+    lam_post_5 = jax.tree.map(lambda leaf: leaf[4, 1], z.derivative)
+    mu_pre_5 = jax.tree.map(lambda leaf: leaf[5, 0], z.constraint)
+    mu_post_5 = jax.tree.map(lambda leaf: leaf[4, 1], z.constraint)
+
+    assert jnp.allclose(actual_mu(mu_pre_5), expected_mu(lam_pre_5))
+    assert jnp.allclose(actual_mu(mu_post_5), expected_mu(lam_post_5))
+    assert not jnp.allclose(actual_mu(mu_pre_5), actual_mu(mu_post_5))
