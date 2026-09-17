@@ -139,30 +139,56 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
 
     # lam only populates the differential (y) part; mu only the algebraic (x) part.
     assert out.derivative.x is None
-    assert jnp.allclose(out.initial_value.y, out.derivative.y[0])
+
+    # adjoint() now returns, for each of the len(ts)-1 forward integration
+    # intervals, the continuous adjoint's value at BOTH endpoints (the two
+    # one-sided limits bounding that interval), instead of a single
+    # C0-continuous value per ts point. derivative[k, 0] = lambda(ts[k]^+)
+    # (pre-jump, entering interval k) and derivative[k, 1] = lambda(ts[k+1]^-)
+    # (post-jump, the value that seeds the next interval backward).
+    #
+    # In this test's cotangent setup (nonzero only at the LAST point), ts[0]
+    # has zero own cotangent contribution, so lambda(ts[0]^+) == lambda(ts[0]^-)
+    # here specifically -- i.e. derivative[0, 0] genuinely equals
+    # initial_value (lambda(ts[0]^-)), not just by relabeling.
+    assert jnp.allclose(out.initial_value.y, out.derivative.y[0, 0])
 
     # mu(t) should be recoverable purely from lam(t) and the forward solution,
     # by re-deriving the same algebraic relation used inside deriv_adj/da_fn.
+    # Check this comprehensively across every interval endpoint (both sides
+    # of every one of the len(ts)-1 intervals), not just a single point.
     a, _ = ravel_pytree(params)
-    i = -1
-    t = ts[i]
-    x1, _ = ravel_pytree(
-        dae.partition(jax.tree.map(lambda leaf: leaf[i], result.values))[0]
-    )
-    y1, _ = ravel_pytree(
-        dae.partition(jax.tree.map(lambda leaf: leaf[i], result.values))[1]
-    )
-    lam1, _ = ravel_pytree(
-        dae.partition(jax.tree.map(lambda leaf: leaf[i], out.derivative))[1]
-    )
+    points = ts.shape[0]
 
-    _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t, x1, y1)
-    _, _, zdfdx, _ = vjp_deriv(lam1)
-    dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t, x1, y1)
-    expected_mu, _ = ravel_pytree(
-        dae.partition(jax.tree.map(lambda leaf: leaf[i], out.constraint))[0]
-    )
-    assert jnp.allclose(expected_mu, jnp.linalg.solve(dgdx.T, zdfdx))
+    def ravel_state_leaf(leaf):
+        x1, _ = ravel_pytree(dae.partition(leaf)[0])
+        y1, _ = ravel_pytree(dae.partition(leaf)[1])
+        return x1, y1
+
+    def expected_mu_at(k, side):
+        # Interval k covers [ts[k], ts[k+1]]; side 0 -> ts[k], side 1 -> ts[k+1].
+        i = k + side
+        t = ts[i]
+        x1, y1 = ravel_state_leaf(jax.tree.map(lambda leaf: leaf[i], result.values))
+        lam1, _ = ravel_pytree(
+            dae.partition(
+                jax.tree.map(lambda leaf: leaf[k, side], out.derivative)
+            )[1]
+        )
+        _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t, x1, y1)
+        _, _, zdfdx, _ = vjp_deriv(lam1)
+        dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t, x1, y1)
+        return jnp.linalg.solve(dgdx.T, zdfdx)
+
+    def actual_mu_at(k, side):
+        mu1, _ = ravel_pytree(
+            dae.partition(jax.tree.map(lambda leaf: leaf[k, side], out.constraint))[0]
+        )
+        return mu1
+
+    for k in range(points - 1):
+        for side in (0, 1):
+            assert jnp.allclose(actual_mu_at(k, side), expected_mu_at(k, side))
 
 
 def test_adjoint_matches_finite_difference_with_interior_cotangent(dae, params, ts, y0):
