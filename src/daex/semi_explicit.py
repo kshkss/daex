@@ -430,7 +430,7 @@ def _daeint2(
 ]:
     """Perform DAE integration using IDA."""
 
-    x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
+    x, y, yp = _run_forward(callbacks, params, ts, x0, y0, options)
     return x, y, yp
 
 
@@ -460,7 +460,7 @@ def _daeint_fwd2(
 ]:
     n = (quad_order + 3) // 2
     ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
-    x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
+    x, y, yp = _run_forward(callbacks, params, ts, x0, y0, options)
     x1 = x[:: n - 1]
     y1 = y[:: n - 1]
     yp1 = yp[:: n - 1]
@@ -468,7 +468,13 @@ def _daeint_fwd2(
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(0, 5))
-def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
+def _run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
+    """Forward-mode-only DAE integration entry point (`mode="forward"`).
+
+    Unlike `_daeint2`, this is not wrapped in `custom_vjp`, so `jax.jvp` can
+    differentiate through it. It is the forward-mode counterpart of
+    `_daeint2`, mirroring its role as an explicit differentiation boundary.
+    """
     yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
     xy = jnp.append(x0, y0)
     xyp = jnp.append(jnp.zeros_like(x0), yp0)
@@ -511,60 +517,62 @@ def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
     return x, y, yp
 
 
-@run_forward.defjvp
-def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
+@_run_forward.defjvp
+def _run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
     yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
     z_a = jnp.zeros_like(y0)
     z_y0 = d_y0
     z_t0 = -yp0 * d_ts[0]
-
     z0 = jnp.concatenate([y0, z_a, z_y0, z_t0])
-    xy = jnp.append(x0, z0)
-    xyp = jnp.append(
-        jnp.zeros_like(x0), callbacks.deriv_ext((params, d_params), ts[0], x0, z0)
-    )
 
-    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
-    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
+    def sens_derivative(params_dparams, t, xz):
+        params, d_params = params_dparams
+        x, z = xz
+        y, z_a, z_y0, z_t0 = z.reshape([4, -1])
+        yp = callbacks.deriv_fn(params, t, x, y)
 
-    def _call_ida(
-        params: tuple[np.ndarray, np.ndarray],
-        ts: np.ndarray,
-        y0: np.ndarray,
-        yp0: np.ndarray,
-    ):
-        ida = _IDA(
-            callbacks.resfn_ext,
-            jacfn=callbacks.jacfn_ext,
-            userdata=params,
-            algebraic_idx=np.arange(callbacks.x_size),
-            **options,
+        dfda, dfdx, dfdy = jax.jacrev(callbacks.deriv_fn, argnums=[0, 2, 3])(
+            params, t, x, y
         )
-        results = ida.solve(ts, y0, yp0)
-        if not results.success:
-            raise RuntimeError(f"IDA solver failed: {results.message}")
-        if ts.shape[0] == 2:
-            y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
-        else:
-            y = results.y
-            yp = results.yp
-        return y, yp
+        dgda, dgdx, dgdy = jax.jacrev(callbacks.const_fn, argnums=[0, 2, 3])(
+            params, t, x, y
+        )
+        lu_dgdx = jsp.linalg.lu_factor(dgdx)
 
-    xy, xyp = jax.pure_callback(
-        _call_ida,
-        (y_type, yp_type),
+        dxdz_a = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_a)
+        dxdz_y0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_y0)
+        dxdz_t0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_t0)
+        zp_a1 = dfdy @ z_a - dfdx @ dxdz_a
+        zp_y0 = dfdy @ z_y0 - dfdx @ dxdz_y0
+        zp_t0 = dfdy @ z_t0 - dfdx @ dxdz_t0
+
+        dxda = jsp.linalg.lu_solve(lu_dgdx, dgda @ d_params)
+        zp_a2 = dfda @ d_params - dfdx @ dxda
+
+        zp = jnp.concatenate([yp, zp_a1 + zp_a2, zp_y0, zp_t0])
+        return None, zp
+
+    def sens_constraint(params_dparams, t, xz):
+        params, _ = params_dparams
+        x, z = xz
+        y, _, _, _ = z.reshape([4, -1])
+        return callbacks.const_fn(params, t, x, y)
+
+    sens_dae = def_semi_explicit_dae(
+        sens_derivative,
+        sens_constraint,
         (params, d_params),
-        ts,
-        xy,
-        xyp,
-        vmap_method="sequential",
+        ts[0],
+        (x0, z0),
     )
-    x = xy[:, : x0.size]
-    y = xy[:, x0.size :].reshape([ts.size, 4, y0.size])
-    yp = xyp[:, x0.size :].reshape([ts.size, 4, y0.size])
+    a_dparams, _ = ravel_pytree((params, d_params))
+
+    x, y, yp = _run_forward(sens_dae, a_dparams, ts, x0, z0, options)
+
+    y = y.reshape([ts.size, 4, y0.size])
+    yp = yp.reshape([ts.size, 4, y0.size])
 
     dx, dy, dyp = jax.vmap(
         _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0)
@@ -728,7 +736,6 @@ def _daeint_bwd_step2(
     return (dJda, dJdt, -jnp.dot(z[0], yp[0]), None, z[0])
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 6))
 def run_adjoint(callbacks: SemiExplicitDAE, yfunc, params, ts, x1, z1, options: dict):
     zp1 = callbacks.deriv_adj(params, ts[-1], x1, z1, yfunc)
     xz = jnp.append(x1, z1)
@@ -775,77 +782,7 @@ def run_adjoint(callbacks: SemiExplicitDAE, yfunc, params, ts, x1, z1, options: 
     return z[::-1]
 
 
-@run_adjoint.defjvp
-def run_adjoint_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
-    yfunc, params, ts, x1, y1 = primals
-    _, d_params, d_ts, _, d_y1 = tangents
-    zp1 = callbacks.deriv_adj(params, ts[-1], x1, y1, yfunc)
-    z1_a = jnp.zeros_like(y1)
-    z1_y0 = d_y1
-    z1_t0 = -zp1 * d_ts[-1]
-
-    z1 = jnp.concatenate([y1, z1_a, z1_y0, z1_t0])
-    xz = jnp.append(x1, z1)
-    xzp = jnp.append(
-        jnp.zeros_like(x1),
-        callbacks.deriv_adj_ext((params, d_params, yfunc), ts[-1], x1, z1),
-    )
-    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xz.shape), xz.dtype)
-    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xzp.shape), xzp.dtype)
-
-    def _call_ida(
-        params: tuple[np.ndarray, np.ndarray, HermiteSpline],
-        ts: np.ndarray,
-        y0: np.ndarray,
-        yp0: np.ndarray,
-    ):
-        ida = _IDA(
-            callbacks.resfn_adj_ext,
-            jacfn=callbacks.jacfn_adj_ext,
-            userdata=params,
-            algebraic_idx=np.arange(callbacks.x_size),
-            **options,
-        )
-        results = ida.solve(ts, y0, yp0)
-        if not results.success:
-            raise RuntimeError(f"IDA solver failed: {results.message}")
-        if ts.shape[0] == 2:
-            y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
-        else:
-            y = results.y
-            yp = results.yp
-        return y, yp
-
-    xz, xzp = jax.pure_callback(
-        _call_ida,
-        (y_type, yp_type),
-        (params, d_params, yfunc),
-        ts[::-1],
-        xz,
-        xzp,
-        vmap_method="sequential",
-    )
-    x = xz[:, : x1.size]
-    z = xz[:, x1.size :].reshape([ts.size, 4, y1.size])
-    zp = xzp[:, x1.size :].reshape([ts.size, 4, y1.size])
-
-    _, dz, _ = jax.vmap(
-        _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0, None)
-    )(
-        callbacks.deriv_adj,
-        callbacks.const_adj,
-        params,
-        d_params,
-        ts,
-        d_ts,
-        x,
-        z,
-        zp,
-        yfunc,
-    )
-
-    return z[::-1, 0, :], dz[::-1]
+_VALID_MODES = ("forward", "reverse")
 
 
 def daeint[Params, Var](
@@ -854,6 +791,7 @@ def daeint[Params, Var](
     ts: Float[Array, " _"],
     xy0: Var,
     *,
+    mode: str = "reverse",
     quad_order=5,
     options: dict = {},
     options_adj: dict = {},
@@ -863,7 +801,26 @@ def daeint[Params, Var](
 
     Args:
     - options (dict): Additional options for the solver.
+    - mode (str): Differentiation mode, one of "forward" or "reverse"
+      (default "reverse", matching the previous unconditional behavior).
+      Only first-order differentiation is guaranteed for "reverse":
+      - "reverse": differentiate with `jax.grad`/`jax.vjp`. Nesting
+        differentiation transforms beyond first order (e.g.
+        `jax.grad(jax.grad(...))`) is not supported and will raise an
+        error from JAX itself, since it goes through `jax.pure_callback`
+        directly, which has no differentiation rule of its own.
+      - "forward": differentiate with `jax.jvp`. `quad_order` and
+        `options_adj` are unused in this mode, since there is no backward
+        (adjoint) pass. Unlike "reverse", second-order forward-over-forward
+        differentiation (`jax.jvp(jax.jvp(...))`, or equivalently
+        `jax.jacfwd(jax.jacfwd(...))`) is supported and tested (see
+        `tests/test_forward_mode_*.py`), since the JVP rule integrates the
+        sensitivity DAE through `_run_forward` itself rather than through a
+        raw `jax.pure_callback`. Differentiation transforms beyond second
+        order are untested and not guaranteed.
     """
+    if mode not in _VALID_MODES:
+        raise ValueError(f"mode must be one of {_VALID_MODES}, got {mode!r}")
     if quad_order < 0:
         raise NotImplementedError("quad_order must be positive.")
     if quad_order % 2 == 0:
@@ -874,7 +831,10 @@ def daeint[Params, Var](
     y, unravel_y = ravel_pytree(y0)
     a, _ = ravel_pytree(params)
 
-    x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
+    if mode == "forward":
+        x, y, yp = _run_forward(dae, a, ts, x, y, options)
+    else:
+        x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
 
     with jax.profiler.TraceAnnotation("daeint:calc_dxdt"):
 
