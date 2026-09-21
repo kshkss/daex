@@ -32,6 +32,7 @@ def _():
     import altair as alt
     from typing import NamedTuple
     from jax.flatten_util import ravel_pytree
+
     return (
         NamedTuple,
         alt,
@@ -63,15 +64,17 @@ def _(NamedTuple, daeint, def_semi_explicit_dae, jax, jnp):
         )
 
     def constraint(params: Params, t: jax.Array, stat: State) -> jax.Array:
-        return stat.x ** 2 - jnp.sum(stat.y)
+        return stat.x**2 - jnp.sum(stat.y)
 
     def analytic(params: Params, ts: jax.Array, stat0: State) -> State:
         def result(params: Params, t: jax.Array, t0: jax.Array, stat0: State):
-            x = 0.25 * params.a * (t**2 - t0 ** 2) + jnp.sqrt(stat0.y)
+            x = 0.25 * params.a * (t**2 - t0**2) + jnp.sqrt(stat0.y)
             return State(x=x, y=x**2)
 
         u = jax.vmap(result, in_axes=(None, 0, None, None))(params, ts, ts[0], stat0)
-        v = jax.vmap(jax.jacfwd(result, argnums=1), in_axes=(None, 0, None, None))(params, ts, ts[0], stat0)
+        v = jax.vmap(jax.jacfwd(result, argnums=1), in_axes=(None, 0, None, None))(
+            params, ts, ts[0], stat0
+        )
 
         return u, v
 
@@ -119,11 +122,13 @@ def _(analytic, jax, jnp, params, v, y0):
 def _(analytic, jnp, np, params, pl, u, y0):
     _acc, _ = analytic(params, jnp.linspace(0, 1, 11), y0)
 
-    df = pl.DataFrame(dict(
-        t=np.linspace(0, 1, 11),
-        x=np.array(u.x),
-        y=np.array(u.y),
-    )).with_columns(
+    df = pl.DataFrame(
+        dict(
+            t=np.linspace(0, 1, 11),
+            x=np.array(u.x),
+            y=np.array(u.y),
+        )
+    ).with_columns(
         x_acc=np.array(_acc.x),
         y_acc=np.array(_acc.y),
     )
@@ -138,32 +143,32 @@ def _(alt, df):
         alt.Chart(df)
         .mark_point()
         .encode(
-            x=alt.X(field='t', type='quantitative'),
-            y=alt.Y(field='y', type='quantitative', aggregate='mean'),
+            x=alt.X(field="t", type="quantitative"),
+            y=alt.Y(field="y", type="quantitative", aggregate="mean"),
             tooltip=[
-                alt.Tooltip(field='t', format=',.2f'),
-                alt.Tooltip(field='y', aggregate='mean', format=',.2f')
-            ]
+                alt.Tooltip(field="t", format=",.2f"),
+                alt.Tooltip(field="y", aggregate="mean", format=",.2f"),
+            ],
         )
         .properties(
             height=290,
-            width='container',
+            width="container",
         )
     )
     _chart2 = (
         alt.Chart(df)
         .mark_line()
         .encode(
-            x=alt.X(field='t', type='quantitative'),
-            y=alt.Y(field='y_acc', type='quantitative', aggregate='mean'),
+            x=alt.X(field="t", type="quantitative"),
+            y=alt.Y(field="y_acc", type="quantitative", aggregate="mean"),
             tooltip=[
-                alt.Tooltip(field='t', format=',.2f'),
-                alt.Tooltip(field='y', aggregate='mean', format=',.2f')
-            ]
+                alt.Tooltip(field="t", format=",.2f"),
+                alt.Tooltip(field="y", aggregate="mean", format=",.2f"),
+            ],
         )
         .properties(
             height=290,
-            width='container',
+            width="container",
         )
     )
     _chart + _chart2
@@ -177,32 +182,32 @@ def _(alt, df):
         alt.Chart(df)
         .mark_point()
         .encode(
-            x=alt.X(field='t', type='quantitative'),
-            y=alt.Y(field='x', type='quantitative', aggregate='mean'),
+            x=alt.X(field="t", type="quantitative"),
+            y=alt.Y(field="x", type="quantitative", aggregate="mean"),
             tooltip=[
-                alt.Tooltip(field='t', format=',.2f'),
-                alt.Tooltip(field='y', aggregate='mean', format=',.2f')
-            ]
+                alt.Tooltip(field="t", format=",.2f"),
+                alt.Tooltip(field="y", aggregate="mean", format=",.2f"),
+            ],
         )
         .properties(
             height=290,
-            width='container',
+            width="container",
         )
     )
     _chart2 = (
         alt.Chart(df)
         .mark_line()
         .encode(
-            x=alt.X(field='t', type='quantitative'),
-            y=alt.Y(field='x_acc', type='quantitative', aggregate='mean'),
+            x=alt.X(field="t", type="quantitative"),
+            y=alt.Y(field="x_acc", type="quantitative", aggregate="mean"),
             tooltip=[
-                alt.Tooltip(field='t', format=',.2f'),
-                alt.Tooltip(field='y', aggregate='mean', format=',.2f')
-            ]
+                alt.Tooltip(field="t", format=",.2f"),
+                alt.Tooltip(field="y", aggregate="mean", format=",.2f"),
+            ],
         )
         .properties(
             height=290,
-            width='container',
+            width="container",
         )
     )
     _chart + _chart2
@@ -212,7 +217,14 @@ def _(alt, df):
 @app.cell
 def _(dae, daeint, jax, jnp, params, y0):
     def loss1(params, t, y0):
-        u, v = daeint(params, dae, t, y0, quad_order=9, options_adj={"calc_initcond": "yp0", "calc_init_dt": -0.01})
+        u, v = daeint(
+            params,
+            dae,
+            t,
+            y0,
+            quad_order=9,
+            options_adj={"calc_initcond": "yp0", "calc_init_dt": -0.01},
+        )
         return u.y[-1]
 
     jax.grad(loss1, argnums=[0, 1, 2])(params, jnp.linspace(-0.5, 1, 11), y0)
@@ -296,7 +308,10 @@ def _(jax, jnp, loss3, loss3_acc, params, y0):
 @app.cell
 def _(jax, np):
     def hvp(f, primals, tangents):
-      return jax.jvp(jax.grad(f, argnums=np.arange(len(primals))), primals, tangents)[1]
+        return jax.jvp(jax.grad(f, argnums=np.arange(len(primals))), primals, tangents)[
+            1
+        ]
+
     return (hvp,)
 
 
@@ -326,7 +341,11 @@ def _(hvp, jax, jnp, loss1, loss1_acc, params, ravel_pytree, y0):
     _x, _unravel = ravel_pytree(_primals)
     _tangents = _unravel(jnp.zeros_like(_x).at[0].set(1.0))
 
-    jax.tree.map(lambda a, b: jnp.allclose(a, b, 1e-4, 1e-4), hvp(loss1, _primals, _tangents), hvp(loss1_acc, _primals, _tangents))
+    jax.tree.map(
+        lambda a, b: jnp.allclose(a, b, 1e-4, 1e-4),
+        hvp(loss1, _primals, _tangents),
+        hvp(loss1_acc, _primals, _tangents),
+    )
     return
 
 
@@ -356,7 +375,11 @@ def _(hvp, jax, jnp, loss1, loss1_acc, params, ravel_pytree, y0):
     _x, _unravel = ravel_pytree(_primals)
     _tangents = _unravel(jnp.zeros_like(_x).at[1].set(1.0))
 
-    jax.tree.map(lambda a, b: jnp.allclose(a, b, 1e-4, 1e-4), hvp(loss1, _primals, _tangents), hvp(loss1_acc, _primals, _tangents))
+    jax.tree.map(
+        lambda a, b: jnp.allclose(a, b, 1e-4, 1e-4),
+        hvp(loss1, _primals, _tangents),
+        hvp(loss1_acc, _primals, _tangents),
+    )
     return
 
 
