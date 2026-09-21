@@ -171,9 +171,7 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
         t = ts[i]
         x1, y1 = ravel_state_leaf(jax.tree.map(lambda leaf: leaf[i], result.values))
         lam1, _ = ravel_pytree(
-            dae.partition(
-                jax.tree.map(lambda leaf: leaf[k, side], out.derivative)
-            )[1]
+            dae.partition(jax.tree.map(lambda leaf: leaf[k, side], out.derivative))[1]
         )
         _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t, x1, y1)
         _, _, zdfdx, _ = vjp_deriv(lam1)
