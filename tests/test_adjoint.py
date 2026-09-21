@@ -5,7 +5,6 @@ import jax.numpy as jnp
 import pytest
 
 from jax.flatten_util import ravel_pytree
-
 from daex.semi_explicit import Results, adjoint, daeint, def_semi_explicit_dae
 
 jax.config.update("jax_enable_x64", True)
@@ -67,10 +66,10 @@ def test_adjoint_matches_finite_difference_with_cotangent_at_every_point(
     dae, params, ts, y0
 ):
     def loss(params, ts, y0):
-        u, _ = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
+        u, _ = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
         return jnp.sum(u.y)
 
-    result = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
+    result = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
     cotangent = State(
         x=jnp.zeros_like(result.values.x), y=jnp.ones_like(result.values.y)
     )
@@ -93,10 +92,10 @@ def test_adjoint_matches_finite_difference_with_cotangent_at_every_point(
 
 def test_adjoint_matches_finite_difference_with_terminal_cotangent(dae, params, ts, y0):
     def loss(params, ts, y0):
-        u, _ = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
+        u, _ = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
         return u.y[-1]
 
-    result = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
+    result = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
     cotangent = State(
         x=jnp.zeros_like(result.values.x),
         y=jnp.zeros_like(result.values.y).at[-1].set(1.0),
@@ -119,7 +118,7 @@ def test_adjoint_matches_finite_difference_with_terminal_cotangent(dae, params, 
 
 
 def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
-    result = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
+    result = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
     cotangent = State(
         x=jnp.zeros_like(result.values.x),
         y=jnp.zeros_like(result.values.y).at[-1].set(1.0),
@@ -191,10 +190,10 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
 
 def test_adjoint_matches_finite_difference_with_interior_cotangent(dae, params, ts, y0):
     def loss(params, ts, y0):
-        u, _ = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
+        u, _ = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
         return u.y[5]
 
-    result = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
+    result = daeint(params, dae, ts, y0, mode="reverse", **DAEINT_OPTIONS)
     cotangent = State(
         x=jnp.zeros_like(result.values.x),
         y=jnp.zeros_like(result.values.y).at[5].set(1.0),
