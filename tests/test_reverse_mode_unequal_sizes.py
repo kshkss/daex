@@ -3,6 +3,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import pytest
+from jax.experimental.ode import odeint
 
 from daex.semi_explicit import daeint, def_semi_explicit_dae
 
@@ -119,3 +120,49 @@ def test_reverse_mode_ts_gradient_with_nonsymmetric_jacobian(params, ts, y0):
     grad = jax.grad(loss, argnums=[0, 1, 2])(params, ts, y0)
     grad_acc = jax.grad(loss_acc, argnums=[0, 1, 2])(params, ts, y0)
     assert_allclose_tree(grad, grad_acc)
+
+
+def forced_derivative(params: Params, t: jax.Array, stat: State) -> State:
+    return State(x=None, y1=params.a * stat.y2 + t, y2=-stat.y1)
+
+
+def forced_constraint(params: Params, t: jax.Array, stat: State) -> jax.Array:
+    return stat.x - stat.y1 - stat.y2 - jnp.sin(t)
+
+
+def forced_reference(params: Params, ts: jax.Array, stat0: State):
+    def rhs(y, t, a):
+        return jnp.stack([a * y[1] + t, -y[0]])
+
+    y0 = jnp.stack([stat0.y1, stat0.y2])
+    y = odeint(rhs, y0, ts, params.a, rtol=1e-12, atol=1e-12)
+    yp = jax.vmap(rhs, in_axes=(0, 0, None))(y, ts, params.a)
+    values = State(x=y[:, 0] + y[:, 1] + jnp.sin(ts), y1=y[:, 0], y2=y[:, 1])
+    derivatives = State(x=yp[:, 0] + yp[:, 1] + jnp.cos(ts), y1=yp[:, 0], y2=yp[:, 1])
+    return values, derivatives
+
+
+TIGHT = dict(rtol=1e-10, atol=1e-12)
+
+
+def test_reverse_mode_gradient_with_time_dependent_system(params, ts, y0):
+    # f and g depend on t explicitly, so df/dt and dg/dt enter dJ/dt.
+    dae = def_semi_explicit_dae(
+        forced_derivative, forced_constraint, params, jnp.array(0.0), y0
+    )
+
+    # The initial point is excluded for the same reason as above.
+    def reduce(u, up):
+        return jnp.sum((up.y1 * ts)[1:]) + jnp.sum(up.y2[1:]) + jnp.sum(u.x[1:] ** 2)
+
+    def loss(params, ts, y0):
+        u, up = daeint(params, dae, ts, y0, options=TIGHT, options_adj=TIGHT)
+        return reduce(u, up)
+
+    def loss_ref(params, ts, y0):
+        u, up = forced_reference(params, ts, y0)
+        return reduce(u, up)
+
+    grad = jax.grad(loss, argnums=[0, 1, 2])(params, ts, y0)
+    grad_ref = jax.grad(loss_ref, argnums=[0, 1, 2])(params, ts, y0)
+    assert_allclose_tree(grad, grad_ref)
