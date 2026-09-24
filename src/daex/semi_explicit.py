@@ -695,9 +695,19 @@ def _daeint_bwd_step2(
 
     with jax.profiler.TraceAnnotation("daeint:init_adjoint"):
         _, vjp_const = jax.vjp(callbacks.const_fn, params, t1, x1, y1)
-        dgdt, dgdx = jax.jacfwd(callbacks.const_fn, argnums=[1, 2])(params, t1, x1, y1)
+        dgdx = jax.jacfwd(callbacks.const_fn, argnums=2)(params, t1, x1, y1)
         _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
-        dfdt = jax.jacfwd(callbacks.deriv_fn, argnums=1)(params, t1, x1, y1)
+        # dfdt + dfdy @ yp1, dgdt + dgdy @ yp1
+        _, dfdt_total = jax.jvp(
+            lambda t, y: callbacks.deriv_fn(params, t, x1, y),
+            (t1, y1),
+            (jnp.ones_like(t1), yp1),
+        )
+        _, dgdt_total = jax.jvp(
+            lambda t, y: callbacks.const_fn(params, t, x1, y),
+            (t1, y1),
+            (jnp.ones_like(t1), yp1),
+        )
 
         wyp_a, _, wyp_x, wyp_y = vjp_deriv(wyp)
         # lu_dgdx = jsp.linalg.lu_factor(dgdx)
@@ -707,10 +717,9 @@ def _daeint_bwd_step2(
         wx_g_a, _, _, wx_g_y = vjp_const(wx_g)
         dJdt = (
             jnp.dot(wy, yp1)
-            # + jnp.dot(wyp, dfdt + dfdy @ yp1)
-            + jnp.dot(wyp, dfdt + vjp_deriv(yp1)[3])
+            + jnp.dot(wyp, dfdt_total)
             # - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
-            - jnp.dot(wx_g, dgdt + vjp_const(yp1)[3])
+            - jnp.dot(wx_g, dgdt_total)
         )
         # dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
         dJda = wyp_a - wx_g_a
