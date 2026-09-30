@@ -262,13 +262,22 @@ def def_semi_explicit_dae[Params, Var](
 
     @jax.jit
     def residual_adj(params_set, t, xy, xyp):
+        # The adjoint DAE with z = -lambda_f as the differential variable and
+        # zg = -lambda_g and x as the algebraic variables:
+        #   0 = g(t, x, y(t))
+        #   0 = dfdx^T z - dgdx^T zg
+        #   0 = z' + dfdy^T z - dgdy^T zg
         params, yfunc = params_set
         x = xy[:x_size]
-        z = xy[x_size:]
-        zp = xyp[x_size:]
-        res = jnp.concatenate(
-            [const_adj(params, t, x, z, yfunc), zp - deriv_adj(params, t, x, z, yfunc)]
-        )
+        zg = xy[x_size : 2 * x_size]
+        z = xy[2 * x_size :]
+        zp = xyp[2 * x_size :]
+        y = yfunc(t)
+        g, vjp_const = jax.vjp(const_fn, params, t, x, y)
+        _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
+        _, _, zdfdx, zdfdy = vjp_deriv(z)
+        _, _, zgdgdx, zgdgdy = vjp_const(zg)
+        res = jnp.concatenate([g, zdfdx - zgdgdx, zp + zdfdy - zgdgdy])
         return res
 
     def resfn_adj(t, y, yp, res, userdata):
@@ -739,9 +748,14 @@ def _daeint_bwd_step2(
 
 @partial(jax.custom_jvp, nondiff_argnums=(0, 6))
 def run_adjoint(callbacks: SemiExplicitDAE, yfunc, params, ts, x1, z1, options: dict):
-    zp1 = callbacks.deriv_adj(params, ts[-1], x1, z1, yfunc)
-    xz = jnp.append(x1, z1)
-    xzp = jnp.append(jnp.zeros_like(x1), zp1)
+    t1 = ts[-1]
+    y1 = yfunc(t1)
+    zp1 = callbacks.deriv_adj(params, t1, x1, z1, yfunc)
+    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
+    dgdx = jax.jacfwd(callbacks.const_fn, argnums=2)(params, t1, x1, y1)
+    zg1 = jnp.linalg.solve(dgdx.T, vjp_deriv(z1)[2])
+    xz = jnp.concatenate([x1, zg1, z1])
+    xzp = jnp.concatenate([jnp.zeros_like(x1), jnp.zeros_like(zg1), zp1])
 
     y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xz.shape), xz.dtype)
     yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xzp.shape), xzp.dtype)
@@ -756,7 +770,7 @@ def run_adjoint(callbacks: SemiExplicitDAE, yfunc, params, ts, x1, z1, options: 
             callbacks.resfn_adj,
             jacfn=callbacks.jacfn_adj,
             userdata=params,
-            algebraic_idx=np.arange(callbacks.x_size),
+            algebraic_idx=np.arange(2 * callbacks.x_size),
             **options,
         )
         results = ida.solve(ts, y0, yp0)
@@ -779,7 +793,7 @@ def run_adjoint(callbacks: SemiExplicitDAE, yfunc, params, ts, x1, z1, options: 
         xzp,
         vmap_method="sequential",
     )
-    z = xz[:, x1.size :]
+    z = xz[:, 2 * x1.size :]
 
     return z[::-1]
 
