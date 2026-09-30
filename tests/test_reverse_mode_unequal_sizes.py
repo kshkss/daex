@@ -103,11 +103,9 @@ def test_reverse_mode_ts_gradient_with_nonsymmetric_jacobian(params, ts, y0):
     )
 
     # Cotangents on the derivatives and the algebraic variable make the
-    # dJ/dt terms depend on df/dy @ y' and dg/dy @ y'. The initial point is
-    # excluded because cotangents on derivatives/x at ts[0] are not yet
-    # propagated to y0.
+    # dJ/dt terms depend on df/dy @ y' and dg/dy @ y'.
     def reduce(u, up):
-        return jnp.sum((up.y1 * ts)[1:]) + jnp.sum(up.y2[1:]) + jnp.sum(u.x[1:] ** 2)
+        return jnp.sum(up.y1 * ts) + jnp.sum(up.y2) + jnp.sum(u.x**2)
 
     def loss(params, ts, y0):
         u, up = daeint(params, dae, ts, y0)
@@ -151,9 +149,39 @@ def test_reverse_mode_gradient_with_time_dependent_system(params, ts, y0):
         forced_derivative, forced_constraint, params, jnp.array(0.0), y0
     )
 
-    # The initial point is excluded for the same reason as above.
     def reduce(u, up):
-        return jnp.sum((up.y1 * ts)[1:]) + jnp.sum(up.y2[1:]) + jnp.sum(u.x[1:] ** 2)
+        return jnp.sum(up.y1 * ts) + jnp.sum(up.y2) + jnp.sum(u.x**2)
+
+    def loss(params, ts, y0):
+        u, up = daeint(params, dae, ts, y0, options=TIGHT, options_adj=TIGHT)
+        return reduce(u, up)
+
+    def loss_ref(params, ts, y0):
+        u, up = forced_reference(params, ts, y0)
+        return reduce(u, up)
+
+    grad = jax.grad(loss, argnums=[0, 1, 2])(params, ts, y0)
+    grad_ref = jax.grad(loss_ref, argnums=[0, 1, 2])(params, ts, y0)
+    assert_allclose_tree(grad, grad_ref)
+
+
+@pytest.mark.parametrize(
+    "reduce",
+    [
+        lambda u, up: up.y2[0],
+        lambda u, up: u.x[0] ** 2,
+        lambda u, up: up.x[0] * up.y1[0],
+    ],
+    ids=["yp_at_t0", "x_at_t0", "xp_times_yp_at_t0"],
+)
+def test_reverse_mode_gradient_with_cotangent_only_at_initial_point(
+    params, ts, y0, reduce
+):
+    # Cotangents on x and y' at ts[0] reach y0, params and ts[0] through
+    # x0 = x(t0, y0) and y'0 = f(t0, x0, y0).
+    dae = def_semi_explicit_dae(
+        forced_derivative, forced_constraint, params, jnp.array(0.0), y0
+    )
 
     def loss(params, ts, y0):
         u, up = daeint(params, dae, ts, y0, options=TIGHT, options_adj=TIGHT)

@@ -664,13 +664,48 @@ def _daeint_bwd2(
             jnp.zeros_like(wy[0]),
         ),
     )
-    dJdt = dJdt.at[-1].set(dJdt0_prev)
-    dJdy0 = dJdy0 + wy[-1]
+    # The cotangents at ts[0] enter through x0 = x(t0, y0) and yp0 = f(t0, x0, y0).
+    c0, dJdt_point0, dJda_point0 = _point_terms(
+        callbacks, params, ts[-1], x[-1], y[-1], wx[-1], wy[-1], wyp[-1]
+    )
+    dJdt = dJdt.at[-1].set(dJdt0_prev + dJdt_point0)
+    dJda = dJda + dJda_point0
+    dJdy0 = dJdy0 + c0
 
     return (dJda, dJdt[::-1], None, dJdy0)
 
 
 _daeint2.defvjp(_daeint_fwd2, _daeint_bwd2)
+
+
+def _point_terms(
+    callbacks: SemiExplicitDAE,
+    params: Float[Array, " a_size"],
+    t: Float[Array, ""],
+    x: Float[Array, " x_size"],
+    y: Float[Array, " y_size"],
+    wx: Float[Array, " x_size"],
+    wy: Float[Array, " y_size"],
+    wyp: Float[Array, " y_size"],
+) -> tuple[Float[Array, " y_size"], Float[Array, ""], Float[Array, " a_size"]]:
+    """
+    Contributions of the cotangents (wx, wy, wyp) given at a single point.
+
+    With the multipliers mu_f = -wyp, mu_g = -wx_g and mu_y = -c of the
+    article, returns
+    - c = wy + dfdy^T wyp - dgdy^T wx_g: the jump of z = -lambda_f at t,
+    - wyp . df/dt - wx_g . dg/dt: the explicit-time part of dJ/dt,
+    - wyp . df/da - wx_g . dg/da: the point term of dJ/da,
+    where wx_g = dgdx^{-T} (wx + dfdx^T wyp).
+    """
+    _, vjp_const = jax.vjp(callbacks.const_fn, params, t, x, y)
+    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t, x, y)
+    dgdx = jax.jacfwd(callbacks.const_fn, argnums=2)(params, t, x, y)
+
+    wyp_a, wyp_t, wyp_x, wyp_y = vjp_deriv(wyp)
+    wx_g = jnp.linalg.solve(dgdx.T, wx + wyp_x)
+    wx_g_a, wx_g_t, _, wx_g_y = vjp_const(wx_g)
+    return wy + wyp_y - wx_g_y, wyp_t - wx_g_t, wyp_a - wx_g_a
 
 
 def _daeint_bwd_step2(
@@ -703,37 +738,8 @@ def _daeint_bwd_step2(
     yfunc = HermiteSpline(ts, y, yp)
 
     with jax.profiler.TraceAnnotation("daeint:init_adjoint"):
-        _, vjp_const = jax.vjp(callbacks.const_fn, params, t1, x1, y1)
-        dgdx = jax.jacfwd(callbacks.const_fn, argnums=2)(params, t1, x1, y1)
-        _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
-        # dfdt + dfdy @ yp1, dgdt + dgdy @ yp1
-        _, dfdt_total = jax.jvp(
-            lambda t, y: callbacks.deriv_fn(params, t, x1, y),
-            (t1, y1),
-            (jnp.ones_like(t1), yp1),
-        )
-        _, dgdt_total = jax.jvp(
-            lambda t, y: callbacks.const_fn(params, t, x1, y),
-            (t1, y1),
-            (jnp.ones_like(t1), yp1),
-        )
-
-        wyp_a, _, wyp_x, wyp_y = vjp_deriv(wyp)
-        # lu_dgdx = jsp.linalg.lu_factor(dgdx)
-        # wxx = wx + dfdx.T @ wyp
-        wxx = wx + wyp_x
-        wx_g = jnp.linalg.solve(dgdx.T, wxx)
-        wx_g_a, _, _, wx_g_y = vjp_const(wx_g)
-        dJdt = (
-            jnp.dot(wy, yp1)
-            + jnp.dot(wyp, dfdt_total)
-            # - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdt + dgdy @ yp1))
-            - jnp.dot(wx_g, dgdt_total)
-        )
-        # dJda = jnp.dot(wyp, dfda) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgda))
-        dJda = wyp_a - wx_g_a
-        # z1 = wy + jnp.dot(wyp, dfdy) - jnp.dot(wxx, jsp.linalg.lu_solve(lu_dgdx, dgdy))
-        z1 = wy + wyp_y - wx_g_y
+        z1, dJdt_point, dJda = _point_terms(callbacks, params, t1, x1, y1, wx, wy, wyp)
+        dJdt = jnp.dot(z1, yp1) + dJdt_point
 
     z = run_adjoint(callbacks, yfunc, params, ts, x1, z1, options)
 
