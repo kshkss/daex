@@ -87,8 +87,10 @@ def test_adjoint_matches_finite_difference_with_cotangent_at_every_point(
         Results(values=cotangent, derivatives=cotangent_derivative),
     )
 
+    # initial_value is the multiplier mu_{y_0} of y(ts[0]) = y0. With only wy
+    # given at ts[0], mu_f = mu_g = 0 there and dJ/dy0 = wy[0] + mu_{y_0}.
     fd = finite_diff_grad_y(loss, params, ts, y0)
-    assert jnp.allclose(z.initial_value.y, fd, 1e-3, 1e-3)
+    assert jnp.allclose(z.initial_value.y + cotangent.y[0], fd, 1e-3, 1e-3)
 
 
 def test_adjoint_matches_finite_difference_with_terminal_cotangent(dae, params, ts, y0):
@@ -147,11 +149,9 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
     # (pre-jump, entering interval k) and derivative[k, 1] = lambda(ts[k+1]^-)
     # (post-jump, the value that seeds the next interval backward).
     #
-    # In this test's cotangent setup (nonzero only at the LAST point), ts[0]
-    # has zero own cotangent contribution, so lambda(ts[0]^+) == lambda(ts[0]^-)
-    # here specifically -- i.e. derivative[0, 0] genuinely equals
-    # initial_value (lambda(ts[0]^-)), not just by relabeling.
-    assert jnp.allclose(out.initial_value.y, out.derivative.y[0, 0])
+    # initial_value is the multiplier of the initial condition,
+    # mu_{y_0} = -lambda_f(ts[0]^+) = -derivative[0, 0].
+    assert jnp.allclose(out.initial_value.y, -out.derivative.y[0, 0])
 
     # mu(t) should be recoverable purely from lam(t) and the forward solution,
     # by re-deriving the same algebraic relation used inside deriv_adj/da_fn.
@@ -217,11 +217,11 @@ def test_adjoint_matches_finite_difference_with_interior_cotangent(dae, params, 
 
     # The cotangent is injected only at ts[5], so the continuous adjoint
     # must have a genuine jump discontinuity exactly there, of size equal
-    # to that point's own cotangent contribution. A regression that
+    # to that point's own multiplier mu_y = -wy. A regression that
     # duplicated the post-jump value into both sides (discarding
     # lambda(ts[k]+)) would make this difference zero instead.
     jump = z.derivative.y[4, 1] - z.derivative.y[5, 0]
-    assert jnp.allclose(jump, cotangent.y[5], 1e-6, 1e-6)
+    assert jnp.allclose(jump, -cotangent.y[5], 1e-6, 1e-6)
 
     # mu is recomputed pointwise from lambda, so validate BOTH sides at
     # ts[5] independently against the manual algebraic formula (reused
