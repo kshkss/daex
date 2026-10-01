@@ -153,21 +153,50 @@ def test_adjoint_with_two_algebraic_variables(dae, params, ts, y0):
 
     assert jnp.allclose(out.initial_value.y, jax.grad(loss_ref)(y0.y), 1e-5, 1e-5)
 
-    # constraint = lambda_g satisfies dg/dx^T lambda_g = df/dx^T lambda_f at
-    # both ends of every interval. Build the dense Jacobians here from the
-    # user-level functions, independently of the implementation's vjp.
+    # Build the dense Jacobians here from the user-level functions,
+    # independently of the implementation's vjp.
     def dfdx(t, x, y):
         return jax.jacfwd(lambda x: derivative(params, t, State(x=x, y=y)).y)(x)
+
+    # -lambda_f at a point is the sensitivity of the loss over the later
+    # points to the state there: lambda_f(ts[k]+) excludes the cotangents at
+    # ts[k] itself, and lambda_f(ts[k]-) includes them.
+    def future_loss(y, k, include_own):
+        own = jnp.where(include_own, 1.0, 0.0)
+        weight = jnp.ones(ts.size - k).at[0].set(own)[:, None]
+        u, up = reference(params, ts[k:], State(x=solve_x(params, ts[k], y), y=y))
+        return (
+            jnp.sum(u.x * wx[k:] * weight)
+            + jnp.sum(u.y * wy[k:] * weight)
+            + jnp.sum(up.y * wyp[k:] * weight)
+        )
+
+    u_ref, _ = reference(params, ts, y0)
 
     for k in range(ts.size - 1):
         for side in (0, 1):
             i = k + side
-            x_i = result.values.x[i]
-            y_i = result.values.y[i]
+            # side 0: lambda_f(ts[k]+), side 1: lambda_f(ts[k+1]-)
+            lam_ref = -jax.grad(future_loss)(u_ref.y[i], i, side == 1)
+            lam_g_ref = jnp.linalg.solve(
+                A.T, dfdx(ts[i], u_ref.x[i], u_ref.y[i]).T @ lam_ref
+            )
             lam = out.derivative.y[k, side]
             lam_g = out.constraint.x[k, side]
+            assert jnp.allclose(lam, lam_ref, 1e-5, 1e-5), (k, side, lam, lam_ref)
+            assert jnp.allclose(lam_g, lam_g_ref, 1e-5, 1e-5), (
+                k,
+                side,
+                lam_g,
+                lam_g_ref,
+            )
+
+            # constraint = lambda_g satisfies dg/dx^T lambda_g = df/dx^T
+            # lambda_f, and with nonsymmetric A, using A instead of A^T would
+            # not match.
+            x_i = result.values.x[i]
+            y_i = result.values.y[i]
             assert jnp.allclose(
                 A.T @ lam_g, dfdx(ts[i], x_i, y_i).T @ lam, 1e-10, 1e-10
             )
-            # With nonsymmetric A, using A instead of A^T would not match.
             assert not jnp.allclose(A @ lam_g, dfdx(ts[i], x_i, y_i).T @ lam)
