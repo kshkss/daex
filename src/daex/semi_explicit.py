@@ -215,43 +215,44 @@ def def_semi_explicit_dae[Params, Var](
         t: jax.Array,
         x: jax.Array,
         y: jax.Array,
+        lam_g: jax.Array,
         lam_f: jax.Array,
     ) -> jax.Array:
-        # The integrand lambda_f^T dfda - lambda_g^T dgda of dJ/da, where
-        # lambda_g = dgdx^{-T} dfdx^T lambda_f.
         _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
-        lam_f_dfda, _, lam_f_dfdx, _ = vjp_deriv(lam_f)
-        dgdx = jax.jacfwd(const_fn, argnums=2)(params, t, x, y)
-        lam_g = jnp.linalg.solve(dgdx.T, lam_f_dfdx)
         _, vjp_const = jax.vjp(const_fn, params, t, x, y)
-        return lam_f_dfda - vjp_const(lam_g)[0]
+        lam_f_dfda, _, _, _ = vjp_deriv(lam_f)
+        lam_g_dgda, _, _, _ = vjp_const(lam_g)
+        return lam_f_dfda - lam_g_dgda
 
     def deriv_adj(
         params: jax.Array,
         t: jax.Array,
         x: jax.Array,
+        y: jax.Array,
+        lam_g: jax.Array,
         lam_f: jax.Array,
-        yfunc: HermiteSpline,
     ):
-        # lambda_f' = -dfdy^T lambda_f + dgdy^T lambda_g with lambda_g eliminated
-        # by dfdx^T lambda_f = dgdx^T lambda_g.
-        y = yfunc(t)
-        _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
-        _, _, lam_f_dfdx, lam_f_dfdy = vjp_deriv(lam_f)
-        dgdx = jax.jacfwd(const_fn, argnums=2)(params, t, x, y)
-        lam_g = jnp.linalg.solve(dgdx.T, lam_f_dfdx)
         _, vjp_const = jax.vjp(const_fn, params, t, x, y)
-        return -(lam_f_dfdy - vjp_const(lam_g)[3])
+        _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
+        _, _, _, lam_f_dfdy = vjp_deriv(lam_f)
+        _, _, _, lam_g_dgdy = vjp_const(lam_g)
+        res = -lam_f_dfdy + lam_g_dgdy
+        return res
 
     def const_adj(
         params: jax.Array,
         t: jax.Array,
         x: jax.Array,
-        z: jax.Array,
-        yfunc: HermiteSpline,
+        y: jax.Array,
+        lam_g: jax.Array,
+        lam_f: jax.Array,
     ):
-        y = yfunc(t)
-        return const_fn(params, t, x, y)
+        g, vjp_const = jax.vjp(const_fn, params, t, x, y)
+        _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
+        _, _, lam_f_dfdx, _ = vjp_deriv(lam_f)
+        _, _, lam_g_dgdx, _ = vjp_const(lam_g)
+        res = jnp.concatenate([g, lam_f_dfdx - lam_g_dgdx])
+        return res
 
     @jax.jit
     def residual_adj(params_set, t, xy, xyp):
@@ -266,13 +267,9 @@ def def_semi_explicit_dae[Params, Var](
         lam_f = xy[2 * x_size :]
         lam_fp = xyp[2 * x_size :]
         y = yfunc(t)
-        g, vjp_const = jax.vjp(const_fn, params, t, x, y)
-        _, vjp_deriv = jax.vjp(deriv_fn, params, t, x, y)
-        _, _, lam_f_dfdx, lam_f_dfdy = vjp_deriv(lam_f)
-        _, _, lam_g_dgdx, lam_g_dgdy = vjp_const(lam_g)
-        res = jnp.concatenate(
-            [g, lam_f_dfdx - lam_g_dgdx, lam_fp + lam_f_dfdy - lam_g_dgdy]
-        )
+        deriv = deriv_adj(params, t, x, y, lam_g, lam_f)
+        const = const_adj(params, t, x, y, lam_g, lam_f)
+        res = jnp.concatenate([const, lam_fp - deriv])
         return res
 
     def resfn_adj(t, y, yp, res, userdata):
@@ -649,18 +646,16 @@ def _daeint_bwd2(
     lam_f_t0, dJda = jax.lax.fori_loop(
         0, points - 1, body, (jnp.zeros_like(wy[0]), jnp.zeros_like(params))
     )
-
     # mu_{y_0} = -lambda_{f,1}(t_0)
     mu_y = mu_y.at[0].set(-lam_f_t0)
-    dJdt, dJda_point = jax.vmap(
+
+    dJdy, dJdt, dJda_point = jax.vmap(
         partial(_point_vjp, callbacks), in_axes=(None, 0, 0, 0, 0, 0, 0, 0)
     )(params, tk, xk, yk, ypk, mu_f, mu_g, mu_y)
     dJda = dJda + jnp.sum(dJda_point, axis=0)
 
     # dJ/dy0 = w_{y,0} + mu_{y_0} - dfdy^T mu_{f_0} + dgdy^T mu_{g_0}
-    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, tk[0], xk[0], yk[0])
-    _, vjp_const = jax.vjp(callbacks.const_fn, params, tk[0], xk[0], yk[0])
-    dJdy0 = wy[0] + mu_y[0] - vjp_deriv(mu_f[0])[3] + vjp_const(mu_g[0])[3]
+    dJdy0 = wy[0] + mu_y[0] + dJdy[0]
 
     return (dJda, dJdt, None, dJdy0)
 
@@ -707,7 +702,7 @@ def _point_vjp(
     mu_f: Float[Array, " y_size"],
     mu_g: Float[Array, " x_size"],
     mu_y: Float[Array, " y_size"],
-) -> tuple[Float[Array, ""], Float[Array, " a_size"]]:
+) -> tuple[Float[Array, " y_size"], Float[Array, ""], Float[Array, " a_size"]]:
     """
     Point terms of the VJP at a time t_k:
         dJ/dt_k = -mu_y . yp - mu_f . dfdt + mu_g . dgdt
@@ -715,10 +710,12 @@ def _point_vjp(
     """
     _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t, x, y)
     _, vjp_const = jax.vjp(callbacks.const_fn, params, t, x, y)
-    mu_f_dfda, mu_f_dfdt, _, _ = vjp_deriv(mu_f)
-    mu_g_dgda, mu_g_dgdt, _, _ = vjp_const(mu_g)
+    mu_f_dfda, mu_f_dfdt, _, mu_f_dfdy = vjp_deriv(mu_f)
+    mu_g_dgda, mu_g_dgdt, _, mu_g_dgdy = vjp_const(mu_g)
+    dJdy = -mu_f_dfdy + mu_g_dgdy
     dJdt = -jnp.dot(mu_y, yp) - mu_f_dfdt + mu_g_dgdt
-    return dJdt, -mu_f_dfda + mu_g_dgda
+    dJda = -mu_f_dfda + mu_g_dgda
+    return dJdy, dJdt, dJda
 
 
 def _daeint_bwd_step2(
@@ -738,11 +735,11 @@ def _daeint_bwd_step2(
     lambda_f^T dfda - lambda_g^T dgda over the interval.
     """
     yfunc = HermiteSpline(ts, y, yp)
-    lam_f = run_adjoint(callbacks, yfunc, params, ts, x[-1], lam_f1, options)
+    lam_g, lam_f = run_adjoint(callbacks, yfunc, params, ts, x[-1], lam_f1, options)
 
     with jax.profiler.TraceAnnotation("daeint:integrate_da"):
-        integrand = jax.vmap(callbacks.da_fn, in_axes=(None, 0, 0, 0, 0))(
-            params, ts, x, y, lam_f
+        integrand = jax.vmap(callbacks.da_fn, in_axes=(None, 0, 0, 0, 0, 0))(
+            params, ts, x, y, lam_g, lam_f
         )
         integral = jnp.dot(ws, integrand)
 
@@ -755,10 +752,10 @@ def run_adjoint(
 ):
     t1 = ts[-1]
     y1 = yfunc(t1)
-    lam_fp1 = callbacks.deriv_adj(params, t1, x1, lam_f1, yfunc)
     _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
     dgdx = jax.jacfwd(callbacks.const_fn, argnums=2)(params, t1, x1, y1)
     lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[2])
+    lam_fp1 = callbacks.deriv_adj(params, t1, x1, y1, lam_g1, lam_f1)
     xz = jnp.concatenate([x1, lam_g1, lam_f1])
     xzp = jnp.concatenate([jnp.zeros_like(x1), jnp.zeros_like(lam_g1), lam_fp1])
 
@@ -798,9 +795,10 @@ def run_adjoint(
         xzp,
         vmap_method="sequential",
     )
+    lam_g = xz[:, x1.size : 2 * x1.size]
     lam_f = xz[:, 2 * x1.size :]
 
-    return lam_f[::-1]
+    return lam_g[::-1], lam_f[::-1]
 
 
 @run_adjoint.defjvp
@@ -1053,7 +1051,7 @@ def adjoint[Params, Var](
         interval_y = jnp.stack([y_r[i], y_r[i - 1]])
         interval_yp = jnp.stack([yp_r[i], yp_r[i - 1]])
         yfunc = HermiteSpline(interval_ts, interval_y, interval_yp)
-        lam = run_adjoint(
+        _, lam = run_adjoint(
             dae, yfunc, a, interval_ts, x_r[i - 1], lam_post_r[i - 1], options
         )
         # Jump condition: lambda_f(ts[k]-) = mu_y at ts[k] + lambda_f(ts[k]+)
