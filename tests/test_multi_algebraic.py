@@ -104,23 +104,24 @@ def assert_allclose_tree(a, b):
     assert all(matches), (a, b)
 
 
-def test_reverse_mode_gradient_with_two_algebraic_variables(dae, params, ts, y0):
+def reduce(ts, u, up):
     # Includes ts[0], so the point multipliers there go through dg/dx^T too.
-    def reduce(u, up):
-        return (
-            jnp.sum((u.x * ts[:, None]) @ WX)
-            + jnp.sum(u.y @ WY)
-            + jnp.sum(up.y @ WYP)
-            + jnp.sum(up.x[:, 0] * up.x[:, 1])
-        )
+    return (
+        jnp.sum((u.x * ts[:, None]) @ WX)
+        + jnp.sum(u.y @ WY)
+        + jnp.sum(up.y @ WYP)
+        + jnp.sum(up.x[:, 0] * up.x[:, 1])
+    )
 
+
+def test_reverse_mode_gradient_with_two_algebraic_variables(dae, params, ts, y0):
     def loss(params, ts, y0):
         u, up = daeint(params, dae, ts, y0, options=TIGHT, options_adj=TIGHT)
-        return reduce(u, up)
+        return reduce(ts, u, up)
 
     def loss_ref(params, ts, y0):
         u, up = reference(params, ts, y0)
-        return reduce(u, up)
+        return reduce(ts, u, up)
 
     grad = jax.grad(loss, argnums=[0, 1, 2])(params, ts, y0)
     grad_ref = jax.grad(loss_ref, argnums=[0, 1, 2])(params, ts, y0)
@@ -129,6 +130,62 @@ def test_reverse_mode_gradient_with_two_algebraic_variables(dae, params, ts, y0)
     # y0.x is not an independent input (x0 is determined by y0).
     assert_allclose_tree(grad[:2], grad_ref[:2])
     assert_allclose_tree(grad[2].y, grad_ref[2].y)
+
+
+def test_reverse_mode_matches_finite_difference_with_two_algebraic_variables(
+    dae, params, ts, y0
+):
+    # Central differences of daeint itself, independent of any AD rule.
+    def loss(params, ts, y):
+        y0 = State(x=solve_x(params, ts[0], y), y=y)
+        u, up = daeint(params, dae, ts, y0, options=TIGHT, options_adj=TIGHT)
+        return reduce(ts, u, up)
+
+    grad_params, grad_ts, grad_y = jax.grad(loss, argnums=[0, 1, 2])(params, ts, y0.y)
+
+    eps = 1e-4
+
+    def central(direction):
+        d_params, d_ts, d_y = direction
+        plus = loss(
+            jax.tree.map(lambda p, d: p + eps * d, params, d_params),
+            ts + eps * d_ts,
+            y0.y + eps * d_y,
+        )
+        minus = loss(
+            jax.tree.map(lambda p, d: p - eps * d, params, d_params),
+            ts - eps * d_ts,
+            y0.y - eps * d_y,
+        )
+        return (plus - minus) / (2 * eps)
+
+    zero_params = Params(a=jnp.array(0.0), b=jnp.array(0.0))
+    zero_ts = jnp.zeros_like(ts)
+    zero_y = jnp.zeros_like(y0.y)
+    cases = {
+        "a": ((zero_params._replace(a=jnp.array(1.0)), zero_ts, zero_y), grad_params.a),
+        "b": ((zero_params._replace(b=jnp.array(1.0)), zero_ts, zero_y), grad_params.b),
+        "y0[0]": ((zero_params, zero_ts, zero_y.at[0].set(1.0)), grad_y[0]),
+        "y0[1]": ((zero_params, zero_ts, zero_y.at[1].set(1.0)), grad_y[1]),
+        "ts[2]": ((zero_params, zero_ts.at[2].set(1.0), zero_y), grad_ts[2]),
+    }
+    for name, (direction, expected) in cases.items():
+        fd = central(direction)
+        assert jnp.allclose(expected, fd, 1e-6, 1e-6), (name, expected, fd)
+
+    # A generic direction mixing all inputs.
+    key_a, key_t, key_y = jax.random.split(jax.random.PRNGKey(0), 3)
+    d_params = Params(a=jax.random.normal(key_a), b=-jax.random.normal(key_a))
+    d_ts = 0.1 * jax.random.normal(key_t, ts.shape)
+    d_y = jax.random.normal(key_y, y0.y.shape)
+    directional = (
+        grad_params.a * d_params.a
+        + grad_params.b * d_params.b
+        + jnp.dot(grad_ts, d_ts)
+        + jnp.dot(grad_y, d_y)
+    )
+    fd = central((d_params, d_ts, d_y))
+    assert jnp.allclose(directional, fd, 1e-6, 1e-6), (directional, fd)
 
 
 def test_adjoint_with_two_algebraic_variables(dae, params, ts, y0):
