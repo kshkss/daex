@@ -11,7 +11,9 @@ jax.config.update("jax_enable_x64", True)
 
 # Two algebraic variables with nonsymmetric dg/dx and df/dx, so that a
 # transposed Jacobian or a mixed-up [x, lambda_g, lambda_f] layout in the
-# adjoint DAE changes the result.
+# adjoint DAE changes the result. The constraint depends on the parameter b
+# (and f only on a), so the mu_g^T dg/da and lambda_g^T dg/da terms of the
+# parameter gradient are exercised separately from the df/da terms.
 A = jnp.array([[2.0, 1.0], [0.5, 3.0]])  # dg/dx
 
 
@@ -21,7 +23,8 @@ class State(NamedTuple):
 
 
 class Params(NamedTuple):
-    a: jax.Array
+    a: jax.Array  # enters f only
+    b: jax.Array  # enters g only
 
 
 def derivative(params: Params, t: jax.Array, stat: State) -> State:
@@ -34,26 +37,36 @@ def derivative(params: Params, t: jax.Array, stat: State) -> State:
     )
 
 
-def g_rhs(t, y):
-    return jnp.stack([y[0] + 0.5 * jnp.sin(t), y[1] ** 2])
+def g_rhs(params: Params, t, y):
+    # dg/db is nonzero at every point, including t = 0.
+    return jnp.stack(
+        [
+            y[0] + params.b * jnp.sin(t) + 0.3 * params.b,
+            y[1] ** 2 + params.b * y[0],
+        ]
+    )
 
 
 def constraint(params: Params, t: jax.Array, stat: State) -> jax.Array:
-    return A @ stat.x - g_rhs(t, stat.y)
+    return A @ stat.x - g_rhs(params, t, stat.y)
 
 
-def solve_x(t, y):
-    return jnp.linalg.solve(A, g_rhs(t, y))
+def solve_x(params: Params, t, y):
+    return jnp.linalg.solve(A, g_rhs(params, t, y))
 
 
 def reference(params: Params, ts: jax.Array, stat0: State):
-    def rhs(y, t, a):
-        return derivative(Params(a=a), t, State(x=solve_x(t, y), y=y)).y
+    def rhs(y, t, params):
+        return derivative(params, t, State(x=solve_x(params, t, y), y=y)).y
 
-    y = odeint(rhs, stat0.y, ts, params.a, rtol=1e-12, atol=1e-12)
-    yp = jax.vmap(rhs, in_axes=(0, 0, None))(y, ts, params.a)
-    x = jax.vmap(solve_x)(ts, y)
-    xp = jax.vmap(lambda t, y, yp: jax.jvp(solve_x, (t, y), (1.0, yp))[1])(ts, y, yp)
+    y = odeint(rhs, stat0.y, ts, params, rtol=1e-12, atol=1e-12)
+    yp = jax.vmap(rhs, in_axes=(0, 0, None))(y, ts, params)
+    x = jax.vmap(solve_x, in_axes=(None, 0, 0))(params, ts, y)
+    xp = jax.vmap(
+        lambda t, y, yp: jax.jvp(lambda t, y: solve_x(params, t, y), (t, y), (1.0, yp))[
+            1
+        ]
+    )(ts, y, yp)
     return State(x=x, y=y), State(x=xp, y=yp)
 
 
@@ -65,13 +78,13 @@ WYP = jnp.array([-0.6, 1.1])
 
 @pytest.fixture
 def params():
-    return Params(a=jnp.array(0.8))
+    return Params(a=jnp.array(0.8), b=jnp.array(0.6))
 
 
 @pytest.fixture
-def y0():
+def y0(params):
     y = jnp.array([0.5, 0.4])
-    return State(x=solve_x(jnp.array(0.0), y), y=y)
+    return State(x=solve_x(params, jnp.array(0.0), y), y=y)
 
 
 @pytest.fixture
@@ -111,6 +124,8 @@ def test_reverse_mode_gradient_with_two_algebraic_variables(dae, params, ts, y0)
 
     grad = jax.grad(loss, argnums=[0, 1, 2])(params, ts, y0)
     grad_ref = jax.grad(loss_ref, argnums=[0, 1, 2])(params, ts, y0)
+    # The dg/db path carries a nonzero gradient.
+    assert jnp.abs(grad_ref[0].b) > 1e-2
     # y0.x is not an independent input (x0 is determined by y0).
     assert_allclose_tree(grad[:2], grad_ref[:2])
     assert_allclose_tree(grad[2].y, grad_ref[2].y)
@@ -131,7 +146,7 @@ def test_adjoint_with_two_algebraic_variables(dae, params, ts, y0):
     )
 
     def loss_ref(y):
-        u, up = reference(params, ts, State(x=solve_x(ts[0], y), y=y))
+        u, up = reference(params, ts, State(x=solve_x(params, ts[0], y), y=y))
         return jnp.sum(u.x * wx) + jnp.sum(u.y * wy) + jnp.sum(up.y * wyp)
 
     out = adjoint(params, dae, ts, result, cotangent, options=TIGHT)
