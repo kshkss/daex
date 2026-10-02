@@ -31,9 +31,6 @@ class SemiExplicitDAE(eqx.Module):
     const_adj: Callable
     resfn_adj: Callable
     jacfn_adj: Callable
-    deriv_adj_ext: Callable
-    resfn_adj_ext: Callable
-    jacfn_adj_ext: Callable
     da_fn: Callable
     _clear_cache: Callable
 
@@ -287,77 +284,6 @@ def def_semi_explicit_dae[Params, Var](
         dy, dyp = jacobian_adj(userdata, t, y, yp)
         JJ[:, :] = np.asarray(dy + cj * dyp)
 
-    def deriv_adj_ext(
-        params_array: tuple[jax.Array, jax.Array, HermiteSpline],
-        t: jax.Array,
-        x: jax.Array,
-        z: jax.Array,
-    ):
-        params, d_params, yfunc = params_array
-        z, z_a, z_y0, z_t0 = z.reshape([4, -1])
-        yp = deriv_adj(params, t, x, z, yfunc)
-
-        dfda, dfdx, dfdy = jax.jacrev(deriv_adj, argnums=[0, 2, 3])(
-            params, t, x, z, yfunc
-        )
-        dgda, dgdx, dgdy = jax.jacrev(const_adj, argnums=[0, 2, 3])(
-            params, t, x, z, yfunc
-        )
-        lu_dgdx = jsp.linalg.lu_factor(dgdx)
-
-        dxdz_a = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_a)
-        dxdz_y0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_y0)
-        dxdz_t0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_t0)
-        zp_a1 = dfdy @ z_a - dfdx @ dxdz_a
-        zp_y0 = dfdy @ z_y0 - dfdx @ dxdz_y0
-        zp_t0 = dfdy @ z_t0 - dfdx @ dxdz_t0
-
-        dxda = jsp.linalg.lu_solve(lu_dgdx, dgda @ d_params)
-        zp_a2 = dfda @ d_params - dfdx @ dxda
-
-        return jnp.concatenate([yp, zp_a1 + zp_a2, zp_y0, zp_t0])
-
-    def const_adj_ext(
-        params_array: tuple[jax.Array, jax.Array, HermiteSpline],
-        t: jax.Array,
-        x: jax.Array,
-        y: jax.Array,
-    ):
-        params, _, yfunc = params_array
-        y, _, _, _ = y.reshape([4, -1])
-        g = const_adj(params, t, x, y, yfunc)
-        return g
-
-    @jax.jit
-    def residual_adj_ext(params, t, xy, xyp):
-        x = xy[:x_size]
-        y = xy[x_size:]
-        yp = xyp[x_size:]
-        res = jnp.concatenate(
-            [
-                const_adj_ext(params, t, x, y),
-                yp - deriv_adj_ext(params, t, x, y),
-            ]
-        )
-        return res
-
-    def resfn_adj_ext(t, y, yp, res, userdata):
-        t = jnp.asarray(t)
-        y = jnp.asarray(y)
-        yp = jnp.asarray(yp)
-        res[:] = np.asarray(residual_adj_ext(userdata, t, y, yp))
-
-    jacobian_adj_ext = jax.jit(
-        jax.jacrev(residual_adj_ext, argnums=[2, 3], has_aux=False)
-    )
-
-    def jacfn_adj_ext(t, y, yp, res, cj, JJ, userdata):
-        t = jnp.asarray(t)
-        y = jnp.asarray(y)
-        yp = jnp.asarray(yp)
-        dy, dyp = jacobian_adj_ext(userdata, t, y, yp)
-        JJ[:, :] = np.asarray(dy + cj * dyp)
-
     def clear_cache():
         residual._clear_cache()
         jacobian._clear_cache()
@@ -365,8 +291,6 @@ def def_semi_explicit_dae[Params, Var](
         jacobian_ext._clear_cache()
         residual_adj._clear_cache()
         jacobian_adj._clear_cache()
-        residual_adj_ext._clear_cache()
-        jacobian_adj_ext._clear_cache()
 
     return SemiExplicitDAE(
         x_size=x_size,
@@ -382,9 +306,6 @@ def def_semi_explicit_dae[Params, Var](
         const_adj=const_adj,
         resfn_adj=resfn_adj,
         jacfn_adj=jacfn_adj,
-        deriv_adj_ext=deriv_adj_ext,
-        resfn_adj_ext=resfn_adj_ext,
-        jacfn_adj_ext=jacfn_adj_ext,
         da_fn=da_fn,
         _clear_cache=clear_cache,
     )
@@ -746,7 +667,6 @@ def _daeint_bwd_step2(
     return lam_f[0], integral
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 6))
 def run_adjoint(
     callbacks: SemiExplicitDAE, yfunc, params, ts, x1, lam_f1, options: dict
 ):
@@ -799,79 +719,6 @@ def run_adjoint(
     lam_f = xz[:, 2 * x1.size :]
 
     return lam_g[::-1], lam_f[::-1]
-
-
-@run_adjoint.defjvp
-def run_adjoint_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
-    yfunc, params, ts, x1, y1 = primals
-    _, d_params, d_ts, _, d_y1 = tangents
-    zp1 = callbacks.deriv_adj(params, ts[-1], x1, y1, yfunc)
-    z1_a = jnp.zeros_like(y1)
-    z1_y0 = d_y1
-    z1_t0 = -zp1 * d_ts[-1]
-
-    z1 = jnp.concatenate([y1, z1_a, z1_y0, z1_t0])
-    xz = jnp.append(x1, z1)
-    xzp = jnp.append(
-        jnp.zeros_like(x1),
-        callbacks.deriv_adj_ext((params, d_params, yfunc), ts[-1], x1, z1),
-    )
-    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xz.shape), xz.dtype)
-    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xzp.shape), xzp.dtype)
-
-    def _call_ida(
-        params: tuple[np.ndarray, np.ndarray, HermiteSpline],
-        ts: np.ndarray,
-        y0: np.ndarray,
-        yp0: np.ndarray,
-    ):
-        ida = _IDA(
-            callbacks.resfn_adj_ext,
-            jacfn=callbacks.jacfn_adj_ext,
-            userdata=params,
-            algebraic_idx=np.arange(callbacks.x_size),
-            **options,
-        )
-        results = ida.solve(ts, y0, yp0)
-        if not results.success:
-            raise RuntimeError(f"IDA solver failed: {results.message}")
-        if ts.shape[0] == 2:
-            y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
-        else:
-            y = results.y
-            yp = results.yp
-        return y, yp
-
-    xz, xzp = jax.pure_callback(
-        _call_ida,
-        (y_type, yp_type),
-        (params, d_params, yfunc),
-        ts[::-1],
-        xz,
-        xzp,
-        vmap_method="sequential",
-    )
-    x = xz[:, : x1.size]
-    z = xz[:, x1.size :].reshape([ts.size, 4, y1.size])
-    zp = xzp[:, x1.size :].reshape([ts.size, 4, y1.size])
-
-    _, dz, _ = jax.vmap(
-        _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0, None)
-    )(
-        callbacks.deriv_adj,
-        callbacks.const_adj,
-        params,
-        d_params,
-        ts,
-        d_ts,
-        x,
-        z,
-        zp,
-        yfunc,
-    )
-
-    return z[::-1, 0, :], dz[::-1]
 
 
 def daeint[Params, Var](
