@@ -192,7 +192,7 @@ def test_adjoint_with_two_algebraic_variables(dae, params, ts, y0):
     result = daeint(params, dae, ts, y0, options=TIGHT, options_adj=TIGHT)
 
     # Cotangents on x, y and y' at every point except ts[0], so that
-    # initial_value = mu_{y_0} equals dJ/dy0.
+    # mu_y0 = mu_{y_0} equals dJ/dy0.
     mask = (jnp.arange(ts.size) > 0)[:, None]
     wx = mask * WX
     wy = mask * WY
@@ -208,7 +208,7 @@ def test_adjoint_with_two_algebraic_variables(dae, params, ts, y0):
 
     out = adjoint(params, dae, ts, result, cotangent, options=TIGHT)
 
-    assert jnp.allclose(out.initial_value.y, jax.grad(loss_ref)(y0.y), 1e-5, 1e-5)
+    assert jnp.allclose(out.mu_y0.y, jax.grad(loss_ref)(y0.y), 1e-5, 1e-5)
 
     # Build the dense Jacobians here from the user-level functions,
     # independently of the implementation's vjp.
@@ -238,8 +238,8 @@ def test_adjoint_with_two_algebraic_variables(dae, params, ts, y0):
             lam_g_ref = jnp.linalg.solve(
                 A.T, dfdx(ts[i], u_ref.x[i], u_ref.y[i]).T @ lam_ref
             )
-            lam = out.derivative.y[k, side]
-            lam_g = out.constraint.x[k, side]
+            lam = out.lambda_f.y[k, side]
+            lam_g = out.lambda_g.x[k, side]
             assert jnp.allclose(lam, lam_ref, 1e-5, 1e-5), (k, side, lam, lam_ref)
             assert jnp.allclose(lam_g, lam_g_ref, 1e-5, 1e-5), (
                 k,

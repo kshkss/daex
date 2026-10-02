@@ -87,10 +87,10 @@ def test_adjoint_matches_finite_difference_with_cotangent_at_every_point(
         Results(values=cotangent, derivatives=cotangent_derivative),
     )
 
-    # initial_value is the multiplier mu_{y_0} of y(ts[0]) = y0. With only wy
+    # mu_y0 is the multiplier mu_{y_0} of y(ts[0]) = y0. With only wy
     # given at ts[0], mu_f = mu_g = 0 there and dJ/dy0 = wy[0] + mu_{y_0}.
     fd = finite_diff_grad_y(loss, params, ts, y0)
-    assert jnp.allclose(z.initial_value.y + cotangent.y[0], fd, 1e-3, 1e-3)
+    assert jnp.allclose(z.mu_y0.y + cotangent.y[0], fd, 1e-3, 1e-3)
 
 
 def test_adjoint_matches_finite_difference_with_terminal_cotangent(dae, params, ts, y0):
@@ -117,7 +117,7 @@ def test_adjoint_matches_finite_difference_with_terminal_cotangent(dae, params, 
     )
 
     fd = finite_diff_grad_y(loss, params, ts, y0)
-    assert jnp.allclose(z.initial_value.y, fd, 1e-3, 1e-3)
+    assert jnp.allclose(z.mu_y0.y, fd, 1e-3, 1e-3)
 
 
 def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
@@ -140,7 +140,7 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
     )
 
     # lam only populates the differential (y) part; mu only the algebraic (x) part.
-    assert out.derivative.x is None
+    assert out.lambda_f.x is None
 
     # adjoint() now returns, for each of the len(ts)-1 forward integration
     # intervals, the continuous adjoint's value at BOTH endpoints (the two
@@ -149,9 +149,9 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
     # (pre-jump, entering interval k) and derivative[k, 1] = lambda(ts[k+1]^-)
     # (post-jump, the value that seeds the next interval backward).
     #
-    # initial_value is the multiplier of the initial condition,
+    # mu_y0 is the multiplier of the initial condition,
     # mu_{y_0} = -lambda_f(ts[0]^+) = -derivative[0, 0].
-    assert jnp.allclose(out.initial_value.y, -out.derivative.y[0, 0])
+    assert jnp.allclose(out.mu_y0.y, -out.lambda_f.y[0, 0])
 
     # mu(t) should be recoverable purely from lam(t) and the forward solution,
     # by re-deriving the same algebraic relation used inside deriv_adj/da_fn.
@@ -171,7 +171,7 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
         t = ts[i]
         x1, y1 = ravel_state_leaf(jax.tree.map(lambda leaf: leaf[i], result.values))
         lam1, _ = ravel_pytree(
-            dae.partition(jax.tree.map(lambda leaf: leaf[k, side], out.derivative))[1]
+            dae.partition(jax.tree.map(lambda leaf: leaf[k, side], out.lambda_f))[1]
         )
         _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t, x1, y1)
         _, _, zdfdx, _ = vjp_deriv(lam1)
@@ -180,7 +180,7 @@ def test_adjoint_mu_is_recomputed_from_lambda(dae, params, ts, y0):
 
     def actual_mu_at(k, side):
         mu1, _ = ravel_pytree(
-            dae.partition(jax.tree.map(lambda leaf: leaf[k, side], out.constraint))[0]
+            dae.partition(jax.tree.map(lambda leaf: leaf[k, side], out.lambda_g))[0]
         )
         return mu1
 
@@ -213,14 +213,14 @@ def test_adjoint_matches_finite_difference_with_interior_cotangent(dae, params, 
     )
 
     fd = finite_diff_grad_y(loss, params, ts, y0)
-    assert jnp.allclose(z.initial_value.y, fd, 1e-3, 1e-3)
+    assert jnp.allclose(z.mu_y0.y, fd, 1e-3, 1e-3)
 
     # The cotangent is injected only at ts[5], so the continuous adjoint
     # must have a genuine jump discontinuity exactly there, of size equal
     # to that point's own multiplier mu_y = -wy. A regression that
     # duplicated the post-jump value into both sides (discarding
     # lambda(ts[k]+)) would make this difference zero instead.
-    jump = z.derivative.y[4, 1] - z.derivative.y[5, 0]
+    jump = z.lambda_f.y[4, 1] - z.lambda_f.y[5, 0]
     assert jnp.allclose(jump, -cotangent.y[5], 1e-6, 1e-6)
 
     # mu is recomputed pointwise from lambda, so validate BOTH sides at
@@ -248,10 +248,10 @@ def test_adjoint_matches_finite_difference_with_interior_cotangent(dae, params, 
         mu1, _ = ravel_pytree(dae.partition(constraint_var)[0])
         return mu1
 
-    lam_pre_5 = jax.tree.map(lambda leaf: leaf[5, 0], z.derivative)
-    lam_post_5 = jax.tree.map(lambda leaf: leaf[4, 1], z.derivative)
-    mu_pre_5 = jax.tree.map(lambda leaf: leaf[5, 0], z.constraint)
-    mu_post_5 = jax.tree.map(lambda leaf: leaf[4, 1], z.constraint)
+    lam_pre_5 = jax.tree.map(lambda leaf: leaf[5, 0], z.lambda_f)
+    lam_post_5 = jax.tree.map(lambda leaf: leaf[4, 1], z.lambda_f)
+    mu_pre_5 = jax.tree.map(lambda leaf: leaf[5, 0], z.lambda_g)
+    mu_post_5 = jax.tree.map(lambda leaf: leaf[4, 1], z.lambda_g)
 
     assert jnp.allclose(actual_mu(mu_pre_5), expected_mu(lam_pre_5))
     assert jnp.allclose(actual_mu(mu_post_5), expected_mu(lam_post_5))
