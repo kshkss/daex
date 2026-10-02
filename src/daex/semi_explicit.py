@@ -906,8 +906,8 @@ def adjoint[Params, Var](
 
     # lam_f_r[j] / lam_g_r[j] hold the values at both ends of the j-th
     # interval counted from the end, i.e. [ts[k], ts[k+1]] with k = points-2-j.
-    lam_f_r = jnp.zeros((points - 1, 2, y.shape[1]))
-    lam_g_r = jnp.zeros((points - 1, 2, x.shape[1]))
+    lam_f_r = jnp.zeros((points - 1, 2, y.shape[1]), dtype=y.dtype)
+    lam_g_r = jnp.zeros((points - 1, 2, x.shape[1]), dtype=x.dtype)
 
     def body(i, carry):
         lam_next, lam_g_r, lam_f_r = carry
