@@ -1,4 +1,7 @@
 {
+  "sandbox": {
+    "enabled": true
+  },
   "hooks": {
     "PostToolUse": [
       {
