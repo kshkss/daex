@@ -927,9 +927,21 @@ def daeint[Params, Var](
 
 
 class AdjointResult[Var](NamedTuple):
-    derivative: Var
-    constraint: Float[jax.Array, " constraints"]
-    initial_value: Var
+    """
+    Multipliers of the Lagrangian L defined in the docstring of `adjoint`.
+
+    - lambda_f: lambda_f(t), multiplier of y' = f on each interval.
+    - lambda_g: lambda_g(t), multiplier of g = 0 on each interval.
+    - mu_f: mu_{f_k}, multiplier of yp_k = f(t_k) at every t_k.
+    - mu_g: mu_{g_k}, multiplier of g(t_k) = 0 at every t_k.
+    - mu_y0: mu_{y_0}, multiplier of the initial condition y(t_0) = y0.
+    """
+
+    lambda_f: Var
+    lambda_g: Var
+    mu_f: Var
+    mu_g: Var
+    mu_y0: Var
 
 
 def adjoint[Params, Var](
@@ -949,50 +961,58 @@ def adjoint[Params, Var](
     as in reverse-mode automatic differentiation), integrate the adjoint
     DAE backward.
 
-    Signs follow the Lagrangian
+    The Lagrangian
 
-        L = J + sum_k mu_{y_k}^T (y_k - y(t_k)) + sum_k mu_{f_k}^T (yp_k - f)
-              + sum_k mu_{g_k}^T g + int lambda_f^T (y' - f) dt
-              + int lambda_g^T g dt,
+    Let t_k = ts[k] (k = 0..K, K = len(ts) - 1). The forward problem is
+    y' = f(a, t, x, y), 0 = g(a, t, x, y) on [t_0, t_K] with y(t_0) = y0.
+    The loss J sees the solution only through its values at the sample
+    points, which are introduced as independent variables
+    (x_k, y_k, yp_k) and tied to the trajectory by point constraints
+    (y_0 is y0 itself). The cotangents are wx_k = dJ/dx_k,
+    wy_k = dJ/dy_k, wyp_k = dJ/dyp_k.
 
-    where the sums run over the points of `ts` (with f and g evaluated
-    there) and the integrals over the forward integration intervals, so
-    the adjoint DAE is
+        L(a, y0) = J(x_0..x_K, y_0..y_K, yp_0..yp_K)
+            + sum_{k=0}^{K} mu_{y_k}^T (y_k - y(t_k))
+            + sum_{k=0}^{K} mu_{f_k}^T (yp_k - f(a, t_k, x_k, y_k))
+            + sum_{k=0}^{K} mu_{g_k}^T g(a, t_k, x_k, y_k)
+            + sum_{k=0}^{K-1} int_{t_k}^{t_{k+1}}
+                  [ lambda_f(t)^T (y'(t) - f(a, t, x(t), y(t)))
+                    + lambda_g(t)^T g(a, t, x(t), y(t)) ] dt
 
-        lambda_f' = -dfdy^T lambda_f + dgdy^T lambda_g
-        0 = dfdx^T lambda_f - dgdx^T lambda_g
+    Making L stationary in every primal variable defines the multipliers:
+
+        yp_k:  mu_{f_k} = -wyp_k
+        x_k:   dgdx^T mu_{g_k} = -wx_k + dfdx^T mu_{f_k}
+        y_k:   mu_{y_k} = -wy_k + dfdy^T mu_{f_k} - dgdy^T mu_{g_k}
+               (Jacobians at (t_k, x_k, y_k))
+        x(t), y(t) inside each interval -- the adjoint DAE:
+               lambda_f' = -dfdy^T lambda_f + dgdy^T lambda_g
+               0 = dfdx^T lambda_f - dgdx^T lambda_g
+        y(t_k) (boundary terms of integrating lambda_f^T y' by parts):
+               lambda_f(t_K+) = 0
+               lambda_f(t_k-) = lambda_f(t_k+) + mu_{y_k}   (0 < k <= K)
+               mu_{y_0} = -lambda_f(t_0+)
+
+    With these multipliers the gradients of the loss are
+
+        dJ/dy0 = wy_0 + mu_{y_0} - dfdy^T mu_{f_0} + dgdy^T mu_{g_0}
+        dJ/da = sum_{k=0}^{K} (-dfda^T mu_{f_k} + dgda^T mu_{g_k})
+            - sum_{k=0}^{K-1} int_{t_k}^{t_{k+1}}
+                  (dfda^T lambda_f - dgda^T lambda_g) dt
 
     Returns:
 
-    - `lam`: the continuous-adjoint costate lambda_f(t) for the differential
-      variables `y`. Because the loss can depend on the forward solution
-      at any point of `ts`, lambda_f(t) generally has a jump discontinuity
-      exactly at each interior point of `ts`: `lambda_f(ts[k]-) =
-      lambda_f(ts[k]+) + mu_y`, where `mu_y = -wy + dfdy^T mu_f - dgdy^T
-      mu_g` is that point's own multiplier (`mu_f = -wyp`, `dgdx^T mu_g =
-      -wx + dfdx^T mu_f`). A single value per `ts` point therefore cannot
-      represent it faithfully. Instead, `lam` has shape
-      `(len(ts) - 1, 2, ...)`: for the `k`-th forward integration
-      interval, covering `[ts[k], ts[k+1]]`, `lam[k, 0]` is
-      `lambda_f(ts[k]+)` (the value as the continuous trajectory enters the
-      interval from `ts[k]`, i.e. the limit approached from later times
-      during backward integration, *before* `ts[k]`'s own jump) and
-      `lam[k, 1]` is `lambda_f(ts[k+1]-)` (the value as it reaches
-      `ts[k+1]`, *after* `ts[k+1]`'s own jump has been folded in -- this
-      is exactly the value that seeds backward integration of the next,
-      earlier interval).
-    - `mu`: the Lagrange multiplier lambda_g(t) of the algebraic constraint
-      `g(t, x, y) = 0`, recomputed from `lam` and the forward solution by
-      `dgdx^T lambda_g = dfdx^T lambda_f`. Since lambda_g(t) is a pointwise
-      linear function of lambda_f(t), it inherits the jump and shares
-      its shape: `mu[k, 0]`/`mu[k, 1]` are recomputed from `lam[k,
-      0]`/`lam[k, 1]` respectively.
-    - `nu`: the Lagrange multiplier mu_{y_0} of the initial condition
-      `y(ts[0]) = y0`, i.e. `-lambda_f(ts[0]+)`. The gradient of the loss
-      with respect to `y0` also includes the cotangents given at `ts[0]`
-      itself: `dJ/dy0 = wy + mu_{y_0} - dfdy^T mu_f + dgdy^T mu_g` with the
-      point multipliers at `ts[0]`, so `nu` equals the gradient only when
-      the cotangents at `ts[0]` are zero.
+    - `lambda_f`: lambda_f(t). Because of the jumps at the interior
+      points of `ts`, it is stored per interval with shape
+      `(len(ts) - 1, 2, ...)`: `lambda_f[k, 0]` is lambda_f(t_k+) and
+      `lambda_f[k, 1]` is lambda_f(t_{k+1}-), the value after t_{k+1}'s
+      own jump that seeds backward integration of the next, earlier
+      interval.
+    - `lambda_g`: lambda_g(t), with the same layout as `lambda_f`.
+    - `mu_f`: mu_{f_k} at every point of `ts`, shape `(len(ts), ...)`.
+    - `mu_g`: mu_{g_k} at every point of `ts`, shape `(len(ts), ...)`.
+    - `mu_y0`: mu_{y_0}, the multiplier of the initial condition
+      y(t_0) = y0.
 
     Args:
     - params (Params): Parameters, as passed to `daeint`.
@@ -1030,55 +1050,47 @@ def adjoint[Params, Var](
     x_r = x[::-1]
     y_r = y[::-1]
     yp_r = yp[::-1]
-    wx_r = wx[::-1]
-    wy_r = wy[::-1]
-    wyp_r = wyp[::-1]
 
-    def mu_y_at(i):
-        _, _, mu_y = _point_multipliers(
-            dae, a, ts_r[i], x_r[i], y_r[i], wx_r[i], wy_r[i], wyp_r[i]
-        )
-        return mu_y
+    # Point multipliers mu_f, mu_g, mu_y at every ts[k].
+    mu_f, mu_g, mu_y = jax.vmap(
+        partial(_point_multipliers, dae), in_axes=(None, 0, 0, 0, 0, 0, 0)
+    )(a, ts, x, y, wx, wy, wyp)
+    mu_y_r = mu_y[::-1]
 
-    # lambda_f(ts[-1]) = mu_y at ts[-1]
-    lam0 = mu_y_at(0)
-    lam_post_r = jnp.zeros((points, lam0.size)).at[0].set(lam0)
-    lam_pre_r = jnp.zeros((points, lam0.size)).at[0].set(lam0)  # index 0 unused
+    # lam_f_r[j] / lam_g_r[j] hold the values at both ends of the j-th
+    # interval counted from the end, i.e. [ts[k], ts[k+1]] with k = points-2-j.
+    lam_f_r = jnp.zeros((points - 1, 2, y.shape[1]))
+    lam_g_r = jnp.zeros((points - 1, 2, x.shape[1]))
 
     def body(i, carry):
-        lam_post_r, lam_pre_r = carry
+        lam_next, lam_g_r, lam_f_r = carry
         interval_ts = jnp.stack([ts_r[i], ts_r[i - 1]])
         interval_y = jnp.stack([y_r[i], y_r[i - 1]])
         interval_yp = jnp.stack([yp_r[i], yp_r[i - 1]])
         yfunc = HermiteSpline(interval_ts, interval_y, interval_yp)
-        _, lam = run_adjoint(
-            dae, yfunc, a, interval_ts, x_r[i - 1], lam_post_r[i - 1], options
-        )
         # Jump condition: lambda_f(ts[k]-) = mu_y at ts[k] + lambda_f(ts[k]+)
-        lam_pre_r = lam_pre_r.at[i].set(lam[0])
-        lam_post_r = lam_post_r.at[i].set(mu_y_at(i) + lam[0])
-        return lam_post_r, lam_pre_r
+        lam_f1 = mu_y_r[i - 1] + lam_next
+        lam_g, lam_f = run_adjoint(
+            dae, yfunc, a, interval_ts, x_r[i - 1], lam_f1, options
+        )
+        lam_g_r = lam_g_r.at[i - 1].set(lam_g)
+        lam_f_r = lam_f_r.at[i - 1].set(lam_f)
+        return lam_f[0], lam_g_r, lam_f_r
 
-    lam_post_r, lam_pre_r = jax.lax.fori_loop(1, points, body, (lam_post_r, lam_pre_r))
-    lam_post = lam_post_r[::-1]  # lam_post[k] = lambda_f(ts[k]-)
-    lam_pre = lam_pre_r[::-1]  # lam_pre[k] = lambda_f(ts[k]+), for k < points-1
+    # lambda_{f,K+1}(ts[-1]) = 0
+    _, lam_g_r, lam_f_r = jax.lax.fori_loop(
+        1, points, body, (jnp.zeros_like(wy[0]), lam_g_r, lam_f_r)
+    )
+    lam_g = lam_g_r[::-1]  # lam_g[k] = lambda_g at (ts[k]+, ts[k+1]-)
+    lam_f = lam_f_r[::-1]  # lam_f[k] = lambda_f at (ts[k]+, ts[k+1]-)
 
-    interval_lam = jnp.stack([lam_pre[:-1], lam_post[1:]], axis=1)
-
-    def compute_mu(t, x1, y1, lam1):
-        _, vjp_deriv = jax.vjp(dae.deriv_fn, a, t, x1, y1)
-        # dfdx^T lambda_f = dgdx^T lambda_g
-        _, _, lam_dfdx, _ = vjp_deriv(lam1)
-        dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t, x1, y1)
-        return jnp.linalg.solve(dgdx.T, lam_dfdx)
-
-    mu_pre = jax.vmap(compute_mu)(ts, x, y, lam_pre)
-    mu_post = jax.vmap(compute_mu)(ts, x, y, lam_post)
-    interval_mu = jnp.stack([mu_pre[:-1], mu_post[1:]], axis=1)
-
-    lam_var = jax.vmap(jax.vmap(unravel_y))(interval_lam)
-    mu_var = jax.vmap(jax.vmap(unravel_x))(interval_mu)
     # mu_{y_0} = -lambda_{f,1}(ts[0])
-    nu_var = unravel_y(-lam_pre[0])
+    mu_y0 = -lam_f[0, 0]
 
-    return AdjointResult(derivative=lam_var, constraint=mu_var, initial_value=nu_var)
+    return AdjointResult(
+        lambda_f=jax.vmap(jax.vmap(unravel_y))(lam_f),
+        lambda_g=jax.vmap(jax.vmap(unravel_x))(lam_g),
+        mu_f=jax.vmap(unravel_y)(mu_f),
+        mu_g=jax.vmap(unravel_x)(mu_g),
+        mu_y0=unravel_y(mu_y0),
+    )
