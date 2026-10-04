@@ -559,6 +559,91 @@ def _make_adjoint(
     )
 
 
+class _ExtendedState(NamedTuple):
+    x: Float[Array, " x_size"]
+    y: Float[Array, " y_size"]
+    z_a: Float[Array, " y_size"]
+    z_y0: Float[Array, " y_size"]
+    z_t0: Float[Array, " y_size"]
+
+
+class _ExtendedParams(NamedTuple):
+    a: Float[Array, " a_size"]
+    da: Float[Array, " a_size"]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExtendedModel:
+    model: _Model
+    unravel_x: Callable
+    unravel_y: Callable
+    unravel_a: Callable
+
+    @property
+    def x_size(self) -> int:
+        return self.model.x_size
+
+    def derivative(
+        self, params: _ExtendedParams, t: Float[Array, ""], xy: _ExtendedState
+    ) -> _ExtendedState:
+        a, da = params
+        x, y, z_a, z_y0, z_t0 = xy
+        yp = _deriv_fn(self.model, t, x, y, a)
+
+        dfdx, dfdy, dfda = jax.jacrev(
+            partial(_deriv_fn, self.model), argnums=[1, 2, 3]
+        )(t, x, y, a)
+        dgdx, dgdy, dgda = jax.jacrev(
+            partial(_const_fn, self.model), argnums=[1, 2, 3]
+        )(t, x, y, a)
+        lu_dgdx = jsp.linalg.lu_factor(dgdx)
+
+        dxdz_a = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_a)
+        dxdz_y0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_y0)
+        dxdz_t0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_t0)
+        zp_a1 = dfdy @ z_a - dfdx @ dxdz_a
+        zp_y0 = dfdy @ z_y0 - dfdx @ dxdz_y0
+        zp_t0 = dfdy @ z_t0 - dfdx @ dxdz_t0
+
+        dxda = jsp.linalg.lu_solve(lu_dgdx, dgda @ da)
+        zp_a2 = dfda @ da - dfdx @ dxda
+
+        return _ExtendedState(x=None, y=yp, z_a=zp_a1 + zp_a2, z_y0=zp_y0, z_t0=zp_t0)
+
+    def constraint(
+        self, params: _ExtendedParams, t: Float[Array, ""], xy: _ExtendedState
+    ):
+        a, _ = params
+        return _const_fn(self.model, t, xy.x, xy.y, a)
+
+
+def _make_extended(
+    model: _Model,
+    x0: jax.Array,
+    y0: jax.Array,
+    z_a0: jax.Array,
+    z_y0: jax.Array,
+    z_t0: jax.Array,
+    params: _ExtendedParams,
+) -> tuple[_ExtendedModel, jax.Array, jax.Array, jax.Array]:
+    x = _ExtendedState(x=x0, y=None, z_a=None, z_y0=None, z_t0=None)
+    y = _ExtendedState(x=None, y=y0, z_a=z_a0, z_y0=z_y0, z_t0=z_t0)
+    x, unravel_x = _ravel_pytree(x)
+    y, unravel_y = _ravel_pytree(y)
+    a, unravel_a = _ravel_pytree(params)
+    return (
+        _ExtendedModel(
+            model=model,
+            unravel_x=unravel_x,
+            unravel_y=unravel_y,
+            unravel_a=unravel_a,
+        ),
+        x,
+        y,
+        a,
+    )
+
+
 def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
     y, z_a, z_y0, z_t0 = y
     yp, zp_a, zp_y0, zp_t0 = yp
@@ -703,65 +788,26 @@ def run_forward(
 def run_forward_jvp(
     callbacks: tuple[SemiExplicitDAE, _Model], options: dict, primals, tangents
 ):
-    dae, _ = callbacks
+    _, model = callbacks
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
-    yp0 = dae.deriv_fn(params, ts[0], x0, y0)
+    yp0 = _deriv_fn(model, ts[0], x0, y0, params)
     z_a = jnp.zeros_like(y0)
     z_y0 = d_y0
     z_t0 = -yp0 * d_ts[0]
 
-    z0 = jnp.concatenate([y0, z_a, z_y0, z_t0])
-    xy = jnp.append(x0, z0)
-    xyp = jnp.append(
-        jnp.zeros_like(x0), dae.deriv_ext((params, d_params), ts[0], x0, z0)
+    ext_model, _x, _y, _a = _make_extended(
+        model, x0, y0, z_a, z_y0, z_t0, _ExtendedParams(params, d_params)
     )
-
-    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
-    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
-
-    def _call_ida(
-        params: tuple[np.ndarray, np.ndarray],
-        ts: np.ndarray,
-        y0: np.ndarray,
-        yp0: np.ndarray,
-    ):
-        ida = _IDA(
-            dae.resfn_ext,
-            jacfn=dae.jacfn_ext,
-            userdata=params,
-            algebraic_idx=np.arange(dae.x_size),
-            **options,
-        )
-        results = ida.solve(ts, y0, yp0)
-        if not results.success:
-            raise RuntimeError(f"IDA solver failed: {results.message}")
-        if ts.shape[0] == 2:
-            y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
-        else:
-            y = results.y
-            yp = results.yp
-        return y, yp
-
-    xy, xyp = jax.pure_callback(
-        _call_ida,
-        (y_type, yp_type),
-        (params, d_params),
-        ts,
-        xy,
-        xyp,
-        vmap_method="sequential",
-    )
-    x = xy[:, : x0.size]
-    y = xy[:, x0.size :].reshape([ts.size, 4, y0.size])
-    yp = xyp[:, x0.size :].reshape([ts.size, 4, y0.size])
+    x, y, yp = run_forward((callbacks[0], ext_model), _a, ts, _x, _y, options)
+    y = y.reshape([ts.size, 4, y0.size])
+    yp = yp.reshape([ts.size, 4, y0.size])
 
     dx, dy, dyp = jax.vmap(
         _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0)
     )(
-        dae.deriv_fn,
-        dae.const_fn,
+        lambda a, t, x, y: _deriv_fn(model, t, x, y, a),
+        lambda a, t, x, y: _const_fn(model, t, x, y, a),
         params,
         d_params,
         ts,
