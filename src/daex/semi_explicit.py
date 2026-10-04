@@ -463,6 +463,86 @@ def _jac_fn(
     return jax.jacfwd(shifted)(jnp.zeros_like(xy))
 
 
+class _AdjointState(NamedTuple):
+    x: Float[Array, " x_size"]
+    lam_g: Float[Array, " x_size"]
+    lam_f: Float[Array, " y_size"]
+
+
+class _AdjointParams(NamedTuple):
+    params: Float[Array, " a_size"]
+    yfunc: HermiteSpline
+
+
+@dataclasses.dataclass(frozen=True)
+class _AdjointModel:
+    model: _Model
+    unravel_x: Callable
+    unravel_y: Callable
+    unravel_a: Callable
+    lam_g_size: int
+
+    @property
+    def x_size(self) -> int:
+        return 2 * self.lam_g_size
+
+    def derivative(
+        self, params: _AdjointParams, t: Float[Array, ""], xy: _AdjointState
+    ) -> _AdjointState:
+        a, yfunc = params
+        x, lam_g, lam_f = xy
+        y = yfunc(t)
+
+        _, vjp_deriv = jax.vjp(partial(_deriv_fn, self.model), t, x, y, a)
+        _, vjp_const = jax.vjp(partial(_const_fn, self.model), t, x, y, a)
+        _, _, lam_f_dfdy, _ = vjp_deriv(lam_f)
+        _, _, lam_g_dgdy, _ = vjp_const(lam_g)
+        return _AdjointState(
+            x=None,
+            lam_g=None,
+            lam_f=-lam_f_dfdy + lam_g_dgdy,
+        )
+
+    def constraint(
+        self, params: _AdjointParams, t: Float[Array, ""], xy: _AdjointState
+    ):
+        a, yfunc = params
+        x, lam_g, lam_f = xy
+        y = yfunc(t)
+
+        _, vjp_deriv = jax.vjp(partial(_deriv_fn, self.model), t, x, y, a)
+        g, vjp_const = jax.vjp(partial(_const_fn, self.model), t, x, y, a)
+        _, lam_f_dfdx, _, _ = vjp_deriv(lam_f)
+        _, lam_g_dgdx, _, _ = vjp_const(lam_g)
+        return jnp.concatenate([g, lam_f_dfdx - lam_g_dgdx])
+
+
+def _make_adjoint(
+    model: _Model,
+    x0: jax.Array,
+    lam_g0: jax.Array,
+    lam_f0: jax.Array,
+    params: _AdjointParams,
+) -> tuple[_AdjointModel, jax.Array, jax.Array, jax.Array]:
+    x = _AdjointState(x=x0, lam_g=lam_g0, lam_f=None)
+    y = _AdjointState(x=None, lam_g=None, lam_f=lam_f0)
+    x, unravel_x = _ravel_pytree(x)
+    y, unravel_y = _ravel_pytree(y)
+    a, unravel_a = _ravel_pytree(params)
+    return (
+        _AdjointModel(
+            model=model,
+            unravel_x=unravel_x,
+            unravel_y=unravel_y,
+            unravel_a=unravel_a,
+            lam_g_size=len(lam_g0),
+        ),
+        x,
+        y,
+        a,
+    )
+
+
 def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
     y, z_a, z_y0, z_t0 = y
     yp, zp_a, zp_y0, zp_t0 = yp
@@ -831,9 +911,22 @@ def _daeint_bwd_step2(
     lambda_f(ts[-1]) = lam_f1, and return lambda_f(ts[0]) and the integral of
     lambda_f^T dfda - lambda_g^T dgda over the interval.
     """
-    dae, _ = callbacks
+    dae, model = callbacks
     yfunc = HermiteSpline(ts, y, yp)
-    lam_g, lam_f = run_adjoint(callbacks, yfunc, params, ts, x[-1], lam_f1, options)
+    adj_params = _AdjointParams(params, yfunc)
+
+    t1 = ts[-1]
+    x1 = x[-1]
+    y1 = y[-1]
+    _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t1, x1, y1, params)
+    dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t1, x1, y1, params)
+    lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
+
+    adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
+    _x, _y, _yp = run_forward((callbacks[0], adj_model), _a, ts[::-1], _x, _y, options)
+
+    _, lam_g, _ = jax.vmap(adj_model.unravel_x)(_x[::-1])
+    _, _, lam_f = jax.vmap(adj_model.unravel_y)(_y[::-1])
 
     with jax.profiler.TraceAnnotation("daeint:integrate_da"):
         integrand = jax.vmap(dae.da_fn, in_axes=(None, 0, 0, 0, 0, 0))(
