@@ -1,3 +1,4 @@
+import dataclasses
 from typing import Callable, Any, NamedTuple
 import jax
 import jax.numpy as jnp
@@ -20,6 +21,8 @@ class Results[U](NamedTuple):
 class SemiExplicitDAE(eqx.Module):
     x_size: int
     partition: Callable
+    derivative: Callable
+    constraint: Callable
     deriv_fn: Callable
     const_fn: Callable
     resfn: Callable
@@ -71,6 +74,11 @@ def def_semi_explicit_dae[Params, Var](
     - t0 (jax.Array): Initial coordinate.
 
     - y0 (Var): Initial values of the variables. It is a pytree containing both differential and algebraic variables.
+
+    `deriv_fn` and `const_fn` should be wrapped with `jax.jit` and must not capture arrays
+    as implicit inputs. Compiled code is cached by the identity of these functions,
+    so pass the same jitted objects every time; wrapping them with `jax.jit` again
+    on each call misses the cache.
     """
     yp0 = derivative(params, t0, y0)
     is_algebraic = jax.tree.map(lambda _, yp: yp is None, y0, yp0)
@@ -295,6 +303,8 @@ def def_semi_explicit_dae[Params, Var](
     return SemiExplicitDAE(
         x_size=x_size,
         partition=partition,
+        derivative=derivative,
+        constraint=constraint,
         deriv_fn=deriv_fn,
         const_fn=const_fn,
         resfn=resfn,
@@ -309,6 +319,103 @@ def def_semi_explicit_dae[Params, Var](
         da_fn=da_fn,
         _clear_cache=clear_cache,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class _UnravelEmpty:
+    """Unravel function of a pytree without leaves, comparable by its structure."""
+
+    treedef: Any
+
+    def __call__(self, flat: jax.Array) -> Any:
+        return jax.tree.unflatten(self.treedef, [])
+
+
+def _ravel_pytree(pytree: Any) -> tuple[jax.Array, Callable[[jax.Array], Any]]:
+    """
+    `ravel_pytree` whose unravel function is equal for pytrees of the same structure.
+
+    `ravel_pytree` returns an unravel function that compares by structure, except
+    for a pytree without leaves, where it holds a fresh lambda on every call.
+    """
+    flat, unravel = ravel_pytree(pytree)
+    leaves, treedef = jax.tree.flatten(pytree)
+    if not leaves:
+        return flat, _UnravelEmpty(treedef)
+    return flat, unravel
+
+
+@dataclasses.dataclass(frozen=True)
+class _Model:
+    """
+    User-defined functions and unravel functions of a DAE, passed to jitted
+    functions as a static argument. Equal models share compiled code.
+    """
+
+    derivative: Callable
+    constraint: Callable
+    unravel_a: Callable
+    unravel_x: Callable
+    unravel_y: Callable
+
+
+class _Flattened(NamedTuple):
+    model: _Model
+    x: Float[Array, " x_size"]
+    y: Float[Array, " y_size"]
+    a: Float[Array, " a_size"]
+
+
+def _make_model[Var](dae: SemiExplicitDAE, x0: Var, y0: Var, params: Any) -> _Flattened:
+    x, unravel_x = _ravel_pytree(x0)
+    y, unravel_y = _ravel_pytree(y0)
+    a, unravel_a = _ravel_pytree(params)
+    return _Flattened(
+        model=_Model(
+            derivative=dae.derivative,
+            constraint=dae.constraint,
+            unravel_a=unravel_a,
+            unravel_x=unravel_x,
+            unravel_y=unravel_y,
+        ),
+        x=x,
+        y=y,
+        a=a,
+    )
+
+
+@partial(jax.jit, static_argnums=0)
+def _deriv_fn(
+    model: _Model,
+    t: jax.Array,
+    xarray: jax.Array,
+    yarray: jax.Array,
+    params_array: jax.Array,
+) -> jax.Array:
+    params = model.unravel_a(params_array)
+    x = model.unravel_x(xarray)
+    y = model.unravel_y(yarray)
+    xy = eqx.combine(x, y)
+    yp = model.derivative(params, t, xy)
+    yparray, _ = ravel_pytree(yp)
+    return yparray
+
+
+@partial(jax.jit, static_argnums=0)
+def _const_fn(
+    model: _Model,
+    t: jax.Array,
+    xarray: jax.Array,
+    yarray: jax.Array,
+    params_array: jax.Array,
+) -> jax.Array:
+    params = model.unravel_a(params_array)
+    x = model.unravel_x(xarray)
+    y = model.unravel_y(yarray)
+    xy = eqx.combine(x, y)
+    g = model.constraint(params, t, xy)
+    garray, _ = ravel_pytree(g)
+    return garray
 
 
 def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
@@ -743,9 +850,9 @@ def daeint[Params, Var](
         raise NotImplementedError("quad_order must be odd.")
 
     x0, y0 = dae.partition(xy0)
-    x, unravel_x = ravel_pytree(x0)
-    y, unravel_y = ravel_pytree(y0)
-    a, _ = ravel_pytree(params)
+    model, x, y, a = _make_model(dae, x0, y0, params)
+    unravel_x = model.unravel_x
+    unravel_y = model.unravel_y
 
     x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
 
@@ -873,13 +980,13 @@ def adjoint[Params, Var](
     """
     solution_values, solution_derivative = solution
     cotangent_values, cotangent_derivative = cotangent
-    a, _ = ravel_pytree(params)
 
     x0_sample, y0_sample = dae.partition(
         jax.tree.map(lambda leaf: leaf[0], solution_values)
     )
-    _, unravel_x = ravel_pytree(x0_sample)
-    _, unravel_y = ravel_pytree(y0_sample)
+    model, _, _, a = _make_model(dae, x0_sample, y0_sample, params)
+    unravel_x = model.unravel_x
+    unravel_y = model.unravel_y
 
     def ravel_xy(xy: Var) -> tuple[jax.Array, jax.Array]:
         x0, y0 = dae.partition(xy)
