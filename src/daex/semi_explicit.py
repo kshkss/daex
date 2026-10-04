@@ -917,15 +917,15 @@ def _point_multipliers(
         dgdx^T mu_g = -wx + dfdx^T mu_f
         mu_y = -wy + dfdy^T mu_f - dgdy^T mu_g
     """
-    dae, _ = callbacks
-    _, vjp_deriv = jax.vjp(dae.deriv_fn, params, t, x, y)
-    _, vjp_const = jax.vjp(dae.const_fn, params, t, x, y)
-    dgdx = jax.jacfwd(dae.const_fn, argnums=2)(params, t, x, y)
+    _, model = callbacks
+    _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t, x, y, params)
+    _, vjp_const = jax.vjp(partial(_const_fn, model), t, x, y, params)
+    dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t, x, y, params)
 
     mu_f = -wyp
-    _, _, mu_f_dfdx, mu_f_dfdy = vjp_deriv(mu_f)
+    _, mu_f_dfdx, mu_f_dfdy, _ = vjp_deriv(mu_f)
     mu_g = jnp.linalg.solve(dgdx.T, -wx + mu_f_dfdx)
-    _, _, _, mu_g_dgdy = vjp_const(mu_g)
+    _, _, mu_g_dgdy, _ = vjp_const(mu_g)
     mu_y = -wy + mu_f_dfdy - mu_g_dgdy
     return mu_f, mu_g, mu_y
 
@@ -946,11 +946,11 @@ def _point_vjp(
         dJ/dt_k = -mu_y . yp - mu_f . dfdt + mu_g . dgdt
         -mu_f . dfda + mu_g . dgda  (the point term of dJ/da)
     """
-    dae, _ = callbacks
-    _, vjp_deriv = jax.vjp(dae.deriv_fn, params, t, x, y)
-    _, vjp_const = jax.vjp(dae.const_fn, params, t, x, y)
-    mu_f_dfda, mu_f_dfdt, _, mu_f_dfdy = vjp_deriv(mu_f)
-    mu_g_dgda, mu_g_dgdt, _, mu_g_dgdy = vjp_const(mu_g)
+    _, model = callbacks
+    _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t, x, y, params)
+    _, vjp_const = jax.vjp(partial(_const_fn, model), t, x, y, params)
+    mu_f_dfdt, _, mu_f_dfdy, mu_f_dfda = vjp_deriv(mu_f)
+    mu_g_dgdt, _, mu_g_dgdy, mu_g_dgda = vjp_const(mu_g)
     dJdy = -mu_f_dfdy + mu_g_dgdy
     dJdt = -jnp.dot(mu_y, yp) - mu_f_dfdt + mu_g_dgdt
     dJda = -mu_f_dfda + mu_g_dgda
