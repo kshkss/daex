@@ -357,6 +357,7 @@ class _Model:
     unravel_a: Callable
     unravel_x: Callable
     unravel_y: Callable
+    x_size: int
 
 
 class _Flattened(NamedTuple):
@@ -377,6 +378,7 @@ def _make_model[Var](dae: SemiExplicitDAE, x0: Var, y0: Var, params: Any) -> _Fl
             unravel_a=unravel_a,
             unravel_x=unravel_x,
             unravel_y=unravel_y,
+            x_size=len(x),
         ),
         x=x,
         y=y,
@@ -384,7 +386,6 @@ def _make_model[Var](dae: SemiExplicitDAE, x0: Var, y0: Var, params: Any) -> _Fl
     )
 
 
-@partial(jax.jit, static_argnums=0)
 def _deriv_fn(
     model: _Model,
     t: jax.Array,
@@ -401,7 +402,6 @@ def _deriv_fn(
     return yparray
 
 
-@partial(jax.jit, static_argnums=0)
 def _const_fn(
     model: _Model,
     t: jax.Array,
@@ -416,6 +416,37 @@ def _const_fn(
     g = model.constraint(params, t, xy)
     garray, _ = ravel_pytree(g)
     return garray
+
+
+@partial(jax.jit, static_argnums=0)
+def _res_fn(
+    model: _Model,
+    t: Float[jax.Array, ""],
+    xy: Float[jax.Array, " var_size"],
+    xyp: Float[jax.Array, " var_size"],
+    a: Float[jax.Array, " a_size"],
+) -> Float[jax.Array, " var_size"]:
+    x, y = xy[: model.x_size], xy[model.x_size :]
+    yp = xyp[model.x_size :]
+    g = _const_fn(model, t, x, y, a)
+    f = _deriv_fn(model, t, x, y, a)
+    return jnp.concatenate([g, yp - f])
+
+
+@partial(jax.jit, static_argnums=0)
+def _jac_fn(
+    model: _Model,
+    t: Float[jax.Array, ""],
+    xy: Float[jax.Array, " var_size"],
+    xyp: Float[jax.Array, " var_size"],
+    cj: Float[jax.Array, ""],
+    a: Float[jax.Array, " a_size"],
+) -> Float[jax.Array, "var_size var_size"]:
+    # d/dv res(xy + v, xyp + cj * v) = dres/dxy + cj * dres/dxyp, in one jacfwd.
+    def shifted(v):
+        return _res_fn(model, t, xy + v, xyp + cj * v, a)
+
+    return jax.jacfwd(shifted)(jnp.zeros_like(xy))
 
 
 def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
@@ -502,12 +533,25 @@ def _daeint_fwd2(
 def run_forward(
     callbacks: tuple[SemiExplicitDAE, _Model], params, ts, x0, y0, options: dict
 ):
-    dae, _ = callbacks
+    dae, model = callbacks
     yp0 = dae.deriv_fn(params, ts[0], x0, y0)
     xy = jnp.append(x0, y0)
     xyp = jnp.append(jnp.zeros_like(x0), yp0)
     y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
     yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
+
+    def _residual(t, xy, xyp, res, userdata):
+        t = jnp.asarray(t)
+        xy = jnp.asarray(xy)
+        xyp = jnp.asarray(xyp)
+        res[:] = _res_fn(model, t, xy, xyp, userdata[0])
+
+    def _jacobian(t, xy, xyp, res, cj, JJ, userdata):
+        t = jnp.asarray(t)
+        xy = jnp.asarray(xy)
+        xyp = jnp.asarray(xyp)
+        cj = jnp.asarray(cj)
+        JJ[:, :] = _jac_fn(model, t, xy, xyp, cj, userdata[0])
 
     def _call_ida(params: np.ndarray, ts: np.ndarray, y0: np.ndarray, yp0: np.ndarray):
         ida = _IDA(
