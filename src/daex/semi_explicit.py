@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Callable, Any, NamedTuple
+from typing import Callable, Any, NamedTuple, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
@@ -346,8 +346,19 @@ def _ravel_pytree(pytree: Any) -> tuple[jax.Array, Callable[[jax.Array], Any]]:
     return flat, unravel
 
 
+@runtime_checkable
+class _Model(Protocol):
+    @property
+    def x_size(self) -> int: ...
+    def derivative(self, params: Any, t: Float[jax.Array, ""], xy: Any) -> Any: ...
+    def constraint(self, params: Any, t: Float[jax.Array, ""], xy: Any) -> Any: ...
+    def unravel_a(self, params_array: Float[jax.Array, " a_size"]) -> Any: ...
+    def unravel_x(self, x_array: Float[jax.Array, " x_size"]) -> Any: ...
+    def unravel_y(self, y_array: Float[jax.Array, " y_size"]) -> Any: ...
+
+
 @dataclasses.dataclass(frozen=True)
-class _Model:
+class _ModelUSD:
     """
     User-defined functions and unravel functions of a DAE, passed to jitted
     functions as a static argument. Equal models share compiled code.
@@ -373,7 +384,7 @@ def _make_model[Var](dae: SemiExplicitDAE, x0: Var, y0: Var, params: Any) -> _Fl
     y, unravel_y = _ravel_pytree(y0)
     a, unravel_a = _ravel_pytree(params)
     return _Flattened(
-        model=_Model(
+        model=_ModelUSD(
             derivative=dae.derivative,
             constraint=dae.constraint,
             unravel_a=unravel_a,
