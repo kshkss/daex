@@ -536,8 +536,8 @@ def _daeint_fwd2(
 def run_forward(
     callbacks: tuple[SemiExplicitDAE, _Model], params, ts, x0, y0, options: dict
 ):
-    dae, model = callbacks
-    yp0 = dae.deriv_fn(params, ts[0], x0, y0)
+    _, model = callbacks
+    yp0 = _deriv_fn(model, ts[0], x0, y0, params)
     xy = jnp.append(x0, y0)
     xyp = jnp.append(jnp.zeros_like(x0), yp0)
     y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
@@ -558,10 +558,10 @@ def run_forward(
 
     def _call_ida(params: np.ndarray, ts: np.ndarray, y0: np.ndarray, yp0: np.ndarray):
         ida = _IDA(
-            dae.resfn,
-            jacfn=dae.jacfn,
+            _residual,
+            jacfn=_jacobian,
             userdata=(params,),
-            algebraic_idx=np.arange(dae.x_size),
+            algebraic_idx=np.arange(model.x_size),
             **options,
         )
         results = ida.solve(ts, y0, yp0)
