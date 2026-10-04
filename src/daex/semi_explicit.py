@@ -516,6 +516,22 @@ class _AdjointModel:
         _, lam_g_dgdx, _, _ = vjp_const(lam_g)
         return jnp.concatenate([g, lam_f_dfdx - lam_g_dgdx])
 
+    def da(
+        self,
+        params: _AdjointParams,
+        t: Float[Array, ""],
+        xy: _AdjointState,
+    ) -> jax.Array:
+        a, yfunc = params
+        x, lam_g, lam_f = xy
+        y = yfunc(t)
+
+        _, vjp_deriv = jax.vjp(partial(_deriv_fn, self.model), t, x, y, a)
+        _, vjp_const = jax.vjp(partial(_const_fn, self.model), t, x, y, a)
+        _, _, _, lam_f_dfda = vjp_deriv(lam_f)
+        _, _, _, lam_g_dgda = vjp_const(lam_g)
+        return lam_f_dfda - lam_g_dgda
+
 
 def _make_adjoint(
     model: _Model,
@@ -911,7 +927,7 @@ def _daeint_bwd_step2(
     lambda_f(ts[-1]) = lam_f1, and return lambda_f(ts[0]) and the integral of
     lambda_f^T dfda - lambda_g^T dgda over the interval.
     """
-    dae, model = callbacks
+    _, model = callbacks
     yfunc = HermiteSpline(ts, y, yp)
     adj_params = _AdjointParams(params, yfunc)
 
@@ -925,16 +941,15 @@ def _daeint_bwd_step2(
     adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
     _x, _y, _yp = run_forward((callbacks[0], adj_model), _a, ts[::-1], _x, _y, options)
 
-    _, lam_g, _ = jax.vmap(adj_model.unravel_x)(_x[::-1])
-    _, _, lam_f = jax.vmap(adj_model.unravel_y)(_y[::-1])
+    xy = jax.vmap(
+        lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
+    )(_x[::-1], _y[::-1])
 
     with jax.profiler.TraceAnnotation("daeint:integrate_da"):
-        integrand = jax.vmap(dae.da_fn, in_axes=(None, 0, 0, 0, 0, 0))(
-            params, ts, x, y, lam_g, lam_f
-        )
+        integrand = jax.vmap(adj_model.da, in_axes=(None, 0, 0))(adj_params, ts, xy)
         integral = jnp.dot(ws, integrand)
 
-    return lam_f[0], integral
+    return xy.lam_f[0], integral
 
 
 def run_adjoint(
