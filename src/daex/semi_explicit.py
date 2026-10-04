@@ -1029,13 +1029,13 @@ def daeint[Params, Var](
     with jax.profiler.TraceAnnotation("daeint:calc_dxdt"):
 
         def for_each(a, t, x, y, yp):
-            dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t, x, y)
+            dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t, x, y, a)
             dxdt = -jnp.linalg.solve(
                 dgdx,
                 jax.jvp(
-                    dae.const_fn,
-                    (a, t, x, y),
-                    (jnp.zeros_like(a), jnp.ones_like(t), jnp.zeros_like(x), yp),
+                    partial(_const_fn, model),
+                    (t, x, y, a),
+                    (jnp.ones_like(t), jnp.zeros_like(x), yp, jnp.zeros_like(a)),
                 )[1],
             )
             return dxdt
