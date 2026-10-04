@@ -444,7 +444,7 @@ def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7))
 def _daeint2(
-    callbacks: SemiExplicitDAE,
+    callbacks: tuple[SemiExplicitDAE, _Model],
     params: Float[Array, " a_size"],
     ts: Float[Array, " points"],
     x0: Float[Array, " x_size"],
@@ -458,13 +458,14 @@ def _daeint2(
     Float[Array, " y_size"],
 ]:
     """Perform DAE integration using IDA."""
+    dae, _ = callbacks
 
     x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
     return x, y, yp
 
 
 def _daeint_fwd2(
-    callbacks: SemiExplicitDAE,
+    callbacks: tuple[SemiExplicitDAE, _Model],
     params: Float[Array, " a_size"],
     ts: Float[Array, " points"],
     x0: Float[Array, " x_size"],
@@ -487,6 +488,7 @@ def _daeint_fwd2(
         Float[Array, "interpolated y_size"],
     ],
 ]:
+    dae, _ = callbacks
     n = (quad_order + 3) // 2
     ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
     x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
@@ -497,8 +499,11 @@ def _daeint_fwd2(
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(0, 5))
-def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
-    yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
+def run_forward(
+    callbacks: tuple[SemiExplicitDAE, _Model], params, ts, x0, y0, options: dict
+):
+    dae, _ = callbacks
+    yp0 = dae.deriv_fn(params, ts[0], x0, y0)
     xy = jnp.append(x0, y0)
     xyp = jnp.append(jnp.zeros_like(x0), yp0)
     y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
@@ -506,10 +511,10 @@ def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
 
     def _call_ida(params: np.ndarray, ts: np.ndarray, y0: np.ndarray, yp0: np.ndarray):
         ida = _IDA(
-            callbacks.resfn,
-            jacfn=callbacks.jacfn,
+            dae.resfn,
+            jacfn=dae.jacfn,
             userdata=(params,),
-            algebraic_idx=np.arange(callbacks.x_size),
+            algebraic_idx=np.arange(dae.x_size),
             **options,
         )
         results = ida.solve(ts, y0, yp0)
@@ -541,10 +546,13 @@ def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
 
 
 @run_forward.defjvp
-def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
+def run_forward_jvp(
+    callbacks: tuple[SemiExplicitDAE, _Model], options: dict, primals, tangents
+):
+    dae, _ = callbacks
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
-    yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
+    yp0 = dae.deriv_fn(params, ts[0], x0, y0)
     z_a = jnp.zeros_like(y0)
     z_y0 = d_y0
     z_t0 = -yp0 * d_ts[0]
@@ -552,7 +560,7 @@ def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents
     z0 = jnp.concatenate([y0, z_a, z_y0, z_t0])
     xy = jnp.append(x0, z0)
     xyp = jnp.append(
-        jnp.zeros_like(x0), callbacks.deriv_ext((params, d_params), ts[0], x0, z0)
+        jnp.zeros_like(x0), dae.deriv_ext((params, d_params), ts[0], x0, z0)
     )
 
     y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
@@ -565,10 +573,10 @@ def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents
         yp0: np.ndarray,
     ):
         ida = _IDA(
-            callbacks.resfn_ext,
-            jacfn=callbacks.jacfn_ext,
+            dae.resfn_ext,
+            jacfn=dae.jacfn_ext,
             userdata=params,
-            algebraic_idx=np.arange(callbacks.x_size),
+            algebraic_idx=np.arange(dae.x_size),
             **options,
         )
         results = ida.solve(ts, y0, yp0)
@@ -598,8 +606,8 @@ def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents
     dx, dy, dyp = jax.vmap(
         _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0)
     )(
-        callbacks.deriv_fn,
-        callbacks.const_fn,
+        dae.deriv_fn,
+        dae.const_fn,
         params,
         d_params,
         ts,
@@ -612,7 +620,7 @@ def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents
 
 
 def _daeint_bwd2(
-    callbacks: SemiExplicitDAE,
+    callbacks: tuple[SemiExplicitDAE, _Model],
     quad_order: int,
     options: dict,
     options_adj: dict,
@@ -635,6 +643,7 @@ def _daeint_bwd2(
     None,  # x0
     Float[Array, " y_size"],  # y0
 ]:
+    dae, _ = callbacks
     params, ts, ws, x, y, yp = residuals
     wx, wy, wyp = cotangents
     n = (quad_order + 3) // 2
@@ -692,7 +701,7 @@ _daeint2.defvjp(_daeint_fwd2, _daeint_bwd2)
 
 
 def _point_multipliers(
-    callbacks: SemiExplicitDAE,
+    callbacks: tuple[SemiExplicitDAE, _Model],
     params: Float[Array, " a_size"],
     t: Float[Array, ""],
     x: Float[Array, " x_size"],
@@ -708,9 +717,10 @@ def _point_multipliers(
         dgdx^T mu_g = -wx + dfdx^T mu_f
         mu_y = -wy + dfdy^T mu_f - dgdy^T mu_g
     """
-    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t, x, y)
-    _, vjp_const = jax.vjp(callbacks.const_fn, params, t, x, y)
-    dgdx = jax.jacfwd(callbacks.const_fn, argnums=2)(params, t, x, y)
+    dae, _ = callbacks
+    _, vjp_deriv = jax.vjp(dae.deriv_fn, params, t, x, y)
+    _, vjp_const = jax.vjp(dae.const_fn, params, t, x, y)
+    dgdx = jax.jacfwd(dae.const_fn, argnums=2)(params, t, x, y)
 
     mu_f = -wyp
     _, _, mu_f_dfdx, mu_f_dfdy = vjp_deriv(mu_f)
@@ -721,7 +731,7 @@ def _point_multipliers(
 
 
 def _point_vjp(
-    callbacks: SemiExplicitDAE,
+    callbacks: tuple[SemiExplicitDAE, _Model],
     params: Float[Array, " a_size"],
     t: Float[Array, ""],
     x: Float[Array, " x_size"],
@@ -736,8 +746,9 @@ def _point_vjp(
         dJ/dt_k = -mu_y . yp - mu_f . dfdt + mu_g . dgdt
         -mu_f . dfda + mu_g . dgda  (the point term of dJ/da)
     """
-    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t, x, y)
-    _, vjp_const = jax.vjp(callbacks.const_fn, params, t, x, y)
+    dae, _ = callbacks
+    _, vjp_deriv = jax.vjp(dae.deriv_fn, params, t, x, y)
+    _, vjp_const = jax.vjp(dae.const_fn, params, t, x, y)
     mu_f_dfda, mu_f_dfdt, _, mu_f_dfdy = vjp_deriv(mu_f)
     mu_g_dgda, mu_g_dgdt, _, mu_g_dgdy = vjp_const(mu_g)
     dJdy = -mu_f_dfdy + mu_g_dgdy
@@ -747,7 +758,7 @@ def _point_vjp(
 
 
 def _daeint_bwd_step2(
-    callbacks: SemiExplicitDAE,
+    callbacks: tuple[SemiExplicitDAE, _Model],
     options: dict,
     params: Float[Array, " a_size"],
     ts: Float[Array, " quad_order"],
@@ -762,11 +773,12 @@ def _daeint_bwd_step2(
     lambda_f(ts[-1]) = lam_f1, and return lambda_f(ts[0]) and the integral of
     lambda_f^T dfda - lambda_g^T dgda over the interval.
     """
+    dae, _ = callbacks
     yfunc = HermiteSpline(ts, y, yp)
     lam_g, lam_f = run_adjoint(callbacks, yfunc, params, ts, x[-1], lam_f1, options)
 
     with jax.profiler.TraceAnnotation("daeint:integrate_da"):
-        integrand = jax.vmap(callbacks.da_fn, in_axes=(None, 0, 0, 0, 0, 0))(
+        integrand = jax.vmap(dae.da_fn, in_axes=(None, 0, 0, 0, 0, 0))(
             params, ts, x, y, lam_g, lam_f
         )
         integral = jnp.dot(ws, integrand)
@@ -775,14 +787,21 @@ def _daeint_bwd_step2(
 
 
 def run_adjoint(
-    callbacks: SemiExplicitDAE, yfunc, params, ts, x1, lam_f1, options: dict
+    callbacks: tuple[SemiExplicitDAE, _Model],
+    yfunc,
+    params,
+    ts,
+    x1,
+    lam_f1,
+    options: dict,
 ):
+    dae, _ = callbacks
     t1 = ts[-1]
     y1 = yfunc(t1)
-    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
-    dgdx = jax.jacfwd(callbacks.const_fn, argnums=2)(params, t1, x1, y1)
+    _, vjp_deriv = jax.vjp(dae.deriv_fn, params, t1, x1, y1)
+    dgdx = jax.jacfwd(dae.const_fn, argnums=2)(params, t1, x1, y1)
     lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[2])
-    lam_fp1 = callbacks.deriv_adj(params, t1, x1, y1, lam_g1, lam_f1)
+    lam_fp1 = dae.deriv_adj(params, t1, x1, y1, lam_g1, lam_f1)
     xz = jnp.concatenate([x1, lam_g1, lam_f1])
     xzp = jnp.concatenate([jnp.zeros_like(x1), jnp.zeros_like(lam_g1), lam_fp1])
 
@@ -796,10 +815,10 @@ def run_adjoint(
         yp0: np.ndarray,
     ):
         ida = _IDA(
-            callbacks.resfn_adj,
-            jacfn=callbacks.jacfn_adj,
+            dae.resfn_adj,
+            jacfn=dae.jacfn_adj,
             userdata=params,
-            algebraic_idx=np.arange(2 * callbacks.x_size),
+            algebraic_idx=np.arange(2 * dae.x_size),
             **options,
         )
         results = ida.solve(ts, y0, yp0)
@@ -854,7 +873,7 @@ def daeint[Params, Var](
     unravel_x = model.unravel_x
     unravel_y = model.unravel_y
 
-    x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
+    x, y, yp = _daeint2((dae, model), a, ts, x, y, quad_order, options, options_adj)
 
     with jax.profiler.TraceAnnotation("daeint:calc_dxdt"):
 
@@ -1007,7 +1026,7 @@ def adjoint[Params, Var](
 
     # Point multipliers mu_f, mu_g, mu_y at every ts[k].
     mu_f, mu_g, mu_y = jax.vmap(
-        partial(_point_multipliers, dae), in_axes=(None, 0, 0, 0, 0, 0, 0)
+        partial(_point_multipliers, (dae, model)), in_axes=(None, 0, 0, 0, 0, 0, 0)
     )(a, ts, x, y, wx, wy, wyp)
     mu_y_r = mu_y[::-1]
 
@@ -1025,7 +1044,7 @@ def adjoint[Params, Var](
         # Jump condition: lambda_f(ts[k]-) = mu_y at ts[k] + lambda_f(ts[k]+)
         lam_f1 = mu_y_r[i - 1] + lam_next
         lam_g, lam_f = run_adjoint(
-            dae, yfunc, a, interval_ts, x_r[i - 1], lam_f1, options
+            (dae, model), yfunc, a, interval_ts, x_r[i - 1], lam_f1, options
         )
         lam_g_r = lam_g_r.at[i - 1].set(lam_g)
         lam_f_r = lam_f_r.at[i - 1].set(lam_f)
