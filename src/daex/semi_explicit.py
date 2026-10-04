@@ -1207,14 +1207,25 @@ def adjoint[Params, Var](
         interval_y = jnp.stack([y_r[i], y_r[i - 1]])
         interval_yp = jnp.stack([yp_r[i], yp_r[i - 1]])
         yfunc = HermiteSpline(interval_ts, interval_y, interval_yp)
+        adj_params = _AdjointParams(a, yfunc)
         # Jump condition: lambda_f(ts[k]-) = mu_y at ts[k] + lambda_f(ts[k]+)
         lam_f1 = mu_y_r[i - 1] + lam_next
-        lam_g, lam_f = run_adjoint(
-            (dae, model), yfunc, a, interval_ts, x_r[i - 1], lam_f1, options
+        t1, x1, y1 = ts_r[i - 1], x_r[i - 1], y_r[i - 1]
+        _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t1, x1, y1, a)
+        dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t1, x1, y1, a)
+        lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
+
+        adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
+        _x, _y, _ = run_forward(
+            (dae, adj_model), _a, interval_ts[::-1], _x, _y, options
         )
-        lam_g_r = lam_g_r.at[i - 1].set(lam_g)
-        lam_f_r = lam_f_r.at[i - 1].set(lam_f)
-        return lam_f[0], lam_g_r, lam_f_r
+        xy = jax.vmap(
+            lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
+        )(_x[::-1], _y[::-1])
+
+        lam_g_r = lam_g_r.at[i - 1].set(xy.lam_g)
+        lam_f_r = lam_f_r.at[i - 1].set(xy.lam_f)
+        return xy.lam_f[0], lam_g_r, lam_f_r
 
     # lambda_{f,K+1}(ts[-1]) = 0
     _, lam_g_r, lam_f_r = jax.lax.fori_loop(
