@@ -7,7 +7,8 @@ import numpy as np
 from jax.flatten_util import ravel_pytree
 from sksundae._cy_ida import IDA as _IDA
 import equinox as eqx
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, jaxtyped
+from beartype import beartype as typechecker
 from daex.utils import HermiteSpline
 from daex import utils
 from functools import partial
@@ -419,6 +420,7 @@ def _const_fn(
 
 
 @partial(jax.jit, static_argnums=0)
+@jaxtyped(typechecker=typechecker)
 def _res_fn(
     model: _Model,
     t: Float[jax.Array, ""],
@@ -434,6 +436,7 @@ def _res_fn(
 
 
 @partial(jax.jit, static_argnums=0)
+@jaxtyped(typechecker=typechecker)
 def _jac_fn(
     model: _Model,
     t: Float[jax.Array, ""],
