@@ -783,7 +783,7 @@ def run_forward(model: _Model, params, ts, x0, y0, options: dict):
             raise RuntimeError(f"IDA solver failed: {results.message}")
         if ts.shape[0] == 2:
             y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
+            yp = np.take(results.yp, np.array([0, -1]), axis=0)
         else:
             y = results.y
             yp = results.yp
