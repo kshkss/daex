@@ -20,10 +20,12 @@ class Results[U](NamedTuple):
 
 
 class SemiExplicitDAE(eqx.Module):
-    x_size: int
-    partition: Callable
     derivative: Callable
     constraint: Callable
+    is_algebraic: Any
+    # Callbacks on flattened arrays, kept for backward compatibility.
+    # daex itself does not use them; see `_legacy_callbacks`.
+    x_size: int
     deriv_fn: Callable
     const_fn: Callable
     resfn: Callable
@@ -37,6 +39,11 @@ class SemiExplicitDAE(eqx.Module):
     jacfn_adj: Callable
     da_fn: Callable
     _clear_cache: Callable
+
+    def partition[Var](self, xy: Var) -> tuple[Var, Var]:
+        """Split `xy` into algebraic variables `x` and differential variables `y`."""
+        x, y = eqx.partition(xy, self.is_algebraic, is_leaf=eqx.is_inexact_array)
+        return x, y
 
     def __enter__(self):
         return self
@@ -54,48 +61,60 @@ def def_semi_explicit_dae[Params, Var](
     params: Params,
     t0: jax.Array,
     y0: Var,
-):
+) -> SemiExplicitDAE:
     """
     Function to define a system by
     explicit ODE like as y' = f(t, y),
     or semi-explicit DAE like as y' = f(t, x, y), g(t, x, y) = 0.
 
     Args:
-    - deriv_fn (Callable): A function that takes parameters, a coordinate `t`, and variables `x` and `y`.
+    - derivative (Callable): A function that takes parameters, a coordinate `t`, and variables `x` and `y`.
       It returns the derivative `y'` of the differential variables `y`. The parameters and variables are pytrees.
       The return value `y'` is a pytree with the same structure as the input `x` and `y`,
       but with `None` in the positions corresponding to the algebraic variables `x`.
 
-    - const_fn (Callable): A function that takes the same arguments as `deriv_fn` and returns the residuals
+    - constraint (Callable): A function that takes the same arguments as `derivative` and returns the residuals
       of the constraints for the algebraic variables. The algebraic variables are computed such that the return value
-      of `const_fn` becomes zero. If you want to solve an explicit ODE, you can pass a function that returns `None`.
+      of `constraint` becomes zero. If you want to solve an explicit ODE, you can pass a function that returns `None`.
 
-    - params (Params): Parameters used in `deriv_fn` and `const_fn`. It can be a pytree.
+    - params (Params): Parameters used in `derivative` and `constraint`. It can be a pytree.
 
     - t0 (jax.Array): Initial coordinate.
 
     - y0 (Var): Initial values of the variables. It is a pytree containing both differential and algebraic variables.
 
-    `deriv_fn` and `const_fn` should be wrapped with `jax.jit` and must not capture arrays
+    `derivative` and `constraint` should be wrapped with `jax.jit` and must not capture arrays
     as implicit inputs. Compiled code is cached by the identity of these functions,
     so pass the same jitted objects every time; wrapping them with `jax.jit` again
     on each call misses the cache.
     """
     yp0 = derivative(params, t0, y0)
     is_algebraic = jax.tree.map(lambda _, yp: yp is None, y0, yp0)
-
-    def partition(xy: Var) -> tuple[Var, Var]:
-        x, y = eqx.partition(xy, is_algebraic, is_leaf=eqx.is_inexact_array)
-        return x, y
-
-    x0, y0 = partition(y0)
+    x0, y0 = eqx.partition(y0, is_algebraic, is_leaf=eqx.is_inexact_array)
     try:
         utils.assert_trees_shape_equal(y0, yp0)
     except AssertionError as e:
         raise ValueError(
             "The shapes of initial conditions of differential variables and their derivative do not match. "
-            "Check the initial conditions and deriv_fn()."
+            "Check the initial conditions and derivative()."
         ) from e
+    return SemiExplicitDAE(
+        derivative=derivative,
+        constraint=constraint,
+        is_algebraic=is_algebraic,
+        **_legacy_callbacks(derivative, constraint, params, x0, y0),
+    )
+
+
+def _legacy_callbacks(
+    derivative: Callable, constraint: Callable, params: Any, x0: Any, y0: Any
+) -> dict[str, Any]:
+    """
+    Callbacks on flattened arrays that `SemiExplicitDAE` exposed before the compiled
+    code was shared between DAEs. Kept for backward compatibility only; daex itself
+    does not use them. Their jitted functions belong to each DAE and are discarded
+    by its `_clear_cache`.
+    """
     x, unravel_x = ravel_pytree(x0)
     _, unravel_y = ravel_pytree(y0)
     _, unravel_a = ravel_pytree(params)
@@ -301,11 +320,8 @@ def def_semi_explicit_dae[Params, Var](
         residual_adj._clear_cache()
         jacobian_adj._clear_cache()
 
-    return SemiExplicitDAE(
+    return dict(
         x_size=x_size,
-        partition=partition,
-        derivative=derivative,
-        constraint=constraint,
         deriv_fn=deriv_fn,
         const_fn=const_fn,
         resfn=resfn,
