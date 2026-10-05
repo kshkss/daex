@@ -4,8 +4,10 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.flatten_util import ravel_pytree
 
 from daex.semi_explicit import (
+    SemiExplicitDAE,
     _const_fn,
     _deriv_fn,
     _jac_fn,
@@ -60,14 +62,16 @@ def call_model_fns(dae, params, t, xy):
     )
 
 
-def test_model_fns_match_closures():
+def test_model_fns_match_user_fns():
     params, t0, xy0 = make_problem()
     dae = def_semi_explicit_dae(derivative, constraint, params, t0, xy0)
     x0, y0 = dae.partition(xy0)
     model, x, y, a = _make_model(dae, x0, y0, params)
 
-    np.testing.assert_allclose(_deriv_fn(model, t0, x, y, a), dae.deriv_fn(a, t0, x, y))
-    np.testing.assert_allclose(_const_fn(model, t0, x, y, a), dae.const_fn(a, t0, x, y))
+    yp, _ = ravel_pytree(derivative(params, t0, xy0))
+    g, _ = ravel_pytree(constraint(params, t0, xy0))
+    np.testing.assert_allclose(_deriv_fn(model, t0, x, y, a), yp)
+    np.testing.assert_allclose(_const_fn(model, t0, x, y, a), g)
 
 
 def test_cache_is_reused_across_daes():
@@ -105,8 +109,8 @@ def test_cache_entry_per_structure():
 
 def test_cache_survives_dae_disposal():
     params, t0, xy0 = make_problem()
-    with def_semi_explicit_dae(derivative, constraint, params, t0, xy0) as dae:
-        call_model_fns(dae, params, t0, xy0)
+    dae = def_semi_explicit_dae(derivative, constraint, params, t0, xy0)
+    call_model_fns(dae, params, t0, xy0)
     deriv_size = _res_fn._cache_size()
     const_size = _jac_fn._cache_size()
     assert deriv_size > 0
@@ -114,6 +118,17 @@ def test_cache_survives_dae_disposal():
 
     del dae
     gc.collect()
+    assert _res_fn._cache_size() == deriv_size
+    assert _jac_fn._cache_size() == const_size
+
+
+def test_with_statement_keeps_cache():
+    params, t0, xy0 = make_problem()
+    with def_semi_explicit_dae(derivative, constraint, params, t0, xy0) as dae:
+        assert isinstance(dae, SemiExplicitDAE)
+        call_model_fns(dae, params, t0, xy0)
+        deriv_size = _res_fn._cache_size()
+        const_size = _jac_fn._cache_size()
     assert _res_fn._cache_size() == deriv_size
     assert _jac_fn._cache_size() == const_size
 
