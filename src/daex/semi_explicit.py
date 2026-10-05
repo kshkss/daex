@@ -1,4 +1,5 @@
-from typing import Callable, Any, NamedTuple
+import dataclasses
+from typing import Callable, Any, NamedTuple, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
@@ -6,7 +7,8 @@ import numpy as np
 from jax.flatten_util import ravel_pytree
 from sksundae._cy_ida import IDA as _IDA
 import equinox as eqx
-from jaxtyping import Array, Float
+from jaxtyping import Array, Float, jaxtyped
+from beartype import beartype as typechecker
 from daex.utils import HermiteSpline
 from daex import utils
 from functools import partial
@@ -18,8 +20,12 @@ class Results[U](NamedTuple):
 
 
 class SemiExplicitDAE(eqx.Module):
+    derivative: Callable
+    constraint: Callable
+    is_algebraic: Any
+    # Callbacks on flattened arrays, kept for backward compatibility.
+    # daex itself does not use them; see `_legacy_callbacks`.
     x_size: int
-    partition: Callable
     deriv_fn: Callable
     const_fn: Callable
     resfn: Callable
@@ -33,6 +39,11 @@ class SemiExplicitDAE(eqx.Module):
     jacfn_adj: Callable
     da_fn: Callable
     _clear_cache: Callable
+
+    def partition[Var](self, xy: Var) -> tuple[Var, Var]:
+        """Split `xy` into algebraic variables `x` and differential variables `y`."""
+        x, y = eqx.partition(xy, self.is_algebraic, is_leaf=eqx.is_inexact_array)
+        return x, y
 
     def __enter__(self):
         return self
@@ -50,43 +61,60 @@ def def_semi_explicit_dae[Params, Var](
     params: Params,
     t0: jax.Array,
     y0: Var,
-):
+) -> SemiExplicitDAE:
     """
     Function to define a system by
     explicit ODE like as y' = f(t, y),
     or semi-explicit DAE like as y' = f(t, x, y), g(t, x, y) = 0.
 
     Args:
-    - deriv_fn (Callable): A function that takes parameters, a coordinate `t`, and variables `x` and `y`.
+    - derivative (Callable): A function that takes parameters, a coordinate `t`, and variables `x` and `y`.
       It returns the derivative `y'` of the differential variables `y`. The parameters and variables are pytrees.
       The return value `y'` is a pytree with the same structure as the input `x` and `y`,
       but with `None` in the positions corresponding to the algebraic variables `x`.
 
-    - const_fn (Callable): A function that takes the same arguments as `deriv_fn` and returns the residuals
+    - constraint (Callable): A function that takes the same arguments as `derivative` and returns the residuals
       of the constraints for the algebraic variables. The algebraic variables are computed such that the return value
-      of `const_fn` becomes zero. If you want to solve an explicit ODE, you can pass a function that returns `None`.
+      of `constraint` becomes zero. If you want to solve an explicit ODE, you can pass a function that returns `None`.
 
-    - params (Params): Parameters used in `deriv_fn` and `const_fn`. It can be a pytree.
+    - params (Params): Parameters used in `derivative` and `constraint`. It can be a pytree.
 
     - t0 (jax.Array): Initial coordinate.
 
     - y0 (Var): Initial values of the variables. It is a pytree containing both differential and algebraic variables.
+
+    `derivative` and `constraint` should be wrapped with `jax.jit` and must not capture arrays
+    as implicit inputs. Compiled code is cached by the identity of these functions,
+    so pass the same jitted objects every time; wrapping them with `jax.jit` again
+    on each call misses the cache.
     """
     yp0 = derivative(params, t0, y0)
     is_algebraic = jax.tree.map(lambda _, yp: yp is None, y0, yp0)
-
-    def partition(xy: Var) -> tuple[Var, Var]:
-        x, y = eqx.partition(xy, is_algebraic, is_leaf=eqx.is_inexact_array)
-        return x, y
-
-    x0, y0 = partition(y0)
+    x0, y0 = eqx.partition(y0, is_algebraic, is_leaf=eqx.is_inexact_array)
     try:
         utils.assert_trees_shape_equal(y0, yp0)
     except AssertionError as e:
         raise ValueError(
             "The shapes of initial conditions of differential variables and their derivative do not match. "
-            "Check the initial conditions and deriv_fn()."
+            "Check the initial conditions and derivative()."
         ) from e
+    return SemiExplicitDAE(
+        derivative=derivative,
+        constraint=constraint,
+        is_algebraic=is_algebraic,
+        **_legacy_callbacks(derivative, constraint, params, x0, y0),
+    )
+
+
+def _legacy_callbacks(
+    derivative: Callable, constraint: Callable, params: Any, x0: Any, y0: Any
+) -> dict[str, Any]:
+    """
+    Callbacks on flattened arrays that `SemiExplicitDAE` exposed before the compiled
+    code was shared between DAEs. Kept for backward compatibility only; daex itself
+    does not use them. Their jitted functions belong to each DAE and are discarded
+    by its `_clear_cache`.
+    """
     x, unravel_x = ravel_pytree(x0)
     _, unravel_y = ravel_pytree(y0)
     _, unravel_a = ravel_pytree(params)
@@ -292,9 +320,8 @@ def def_semi_explicit_dae[Params, Var](
         residual_adj._clear_cache()
         jacobian_adj._clear_cache()
 
-    return SemiExplicitDAE(
+    return dict(
         x_size=x_size,
-        partition=partition,
         deriv_fn=deriv_fn,
         const_fn=const_fn,
         resfn=resfn,
@@ -308,6 +335,340 @@ def def_semi_explicit_dae[Params, Var](
         jacfn_adj=jacfn_adj,
         da_fn=da_fn,
         _clear_cache=clear_cache,
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class _UnravelEmpty:
+    """Unravel function of a pytree without leaves, comparable by its structure."""
+
+    treedef: Any
+
+    def __call__(self, flat: jax.Array) -> Any:
+        return jax.tree.unflatten(self.treedef, [])
+
+
+def _ravel_pytree(pytree: Any) -> tuple[jax.Array, Callable[[jax.Array], Any]]:
+    """
+    `ravel_pytree` whose unravel function is equal for pytrees of the same structure.
+
+    `ravel_pytree` returns an unravel function that compares by structure, except
+    for a pytree without leaves, where it holds a fresh lambda on every call.
+    """
+    flat, unravel = ravel_pytree(pytree)
+    leaves, treedef = jax.tree.flatten(pytree)
+    if not leaves:
+        return flat, _UnravelEmpty(treedef)
+    return flat, unravel
+
+
+@runtime_checkable
+class _Model(Protocol):
+    @property
+    def x_size(self) -> int: ...
+    def derivative(self, params: Any, t: Float[jax.Array, ""], xy: Any) -> Any: ...
+    def constraint(self, params: Any, t: Float[jax.Array, ""], xy: Any) -> Any: ...
+    def unravel_a(self, params_array: Float[jax.Array, " a_size"]) -> Any: ...
+    def unravel_x(self, x_array: Float[jax.Array, " x_size"]) -> Any: ...
+    def unravel_y(self, y_array: Float[jax.Array, " y_size"]) -> Any: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class _ModelUSD:
+    """
+    User-defined functions and unravel functions of a DAE, passed to jitted
+    functions as a static argument. Equal models share compiled code.
+    """
+
+    derivative: Callable
+    constraint: Callable
+    unravel_a: Callable
+    unravel_x: Callable
+    unravel_y: Callable
+    x_size: int
+
+
+class _Flattened(NamedTuple):
+    model: _Model
+    x: Float[Array, " x_size"]
+    y: Float[Array, " y_size"]
+    a: Float[Array, " a_size"]
+
+
+def _make_model[Var](dae: SemiExplicitDAE, x0: Var, y0: Var, params: Any) -> _Flattened:
+    x, unravel_x = _ravel_pytree(x0)
+    y, unravel_y = _ravel_pytree(y0)
+    a, unravel_a = _ravel_pytree(params)
+    return _Flattened(
+        model=_ModelUSD(
+            derivative=dae.derivative,
+            constraint=dae.constraint,
+            unravel_a=unravel_a,
+            unravel_x=unravel_x,
+            unravel_y=unravel_y,
+            x_size=len(x),
+        ),
+        x=x,
+        y=y,
+        a=a,
+    )
+
+
+def _deriv_fn(
+    model: _Model,
+    t: jax.Array,
+    xarray: jax.Array,
+    yarray: jax.Array,
+    params_array: jax.Array,
+) -> jax.Array:
+    params = model.unravel_a(params_array)
+    x = model.unravel_x(xarray)
+    y = model.unravel_y(yarray)
+    xy = eqx.combine(x, y)
+    yp = model.derivative(params, t, xy)
+    yparray, _ = ravel_pytree(yp)
+    return yparray
+
+
+def _const_fn(
+    model: _Model,
+    t: jax.Array,
+    xarray: jax.Array,
+    yarray: jax.Array,
+    params_array: jax.Array,
+) -> jax.Array:
+    params = model.unravel_a(params_array)
+    x = model.unravel_x(xarray)
+    y = model.unravel_y(yarray)
+    xy = eqx.combine(x, y)
+    g = model.constraint(params, t, xy)
+    garray, _ = ravel_pytree(g)
+    return garray
+
+
+@partial(jax.jit, static_argnums=0)
+@jaxtyped(typechecker=typechecker)
+def _res_fn(
+    model: _Model,
+    t: Float[jax.Array, ""],
+    xy: Float[jax.Array, " var_size"],
+    xyp: Float[jax.Array, " var_size"],
+    a: Float[jax.Array, " a_size"],
+) -> Float[jax.Array, " var_size"]:
+    x, y = xy[: model.x_size], xy[model.x_size :]
+    yp = xyp[model.x_size :]
+    g = _const_fn(model, t, x, y, a)
+    f = _deriv_fn(model, t, x, y, a)
+    return jnp.concatenate([g, yp - f])
+
+
+@partial(jax.jit, static_argnums=0)
+@jaxtyped(typechecker=typechecker)
+def _jac_fn(
+    model: _Model,
+    t: Float[jax.Array, ""],
+    xy: Float[jax.Array, " var_size"],
+    xyp: Float[jax.Array, " var_size"],
+    cj: Float[jax.Array, ""],
+    a: Float[jax.Array, " a_size"],
+) -> Float[jax.Array, "var_size var_size"]:
+    # d/dv res(xy + v, xyp + cj * v) = dres/dxy + cj * dres/dxyp, in one jacfwd.
+    def shifted(v):
+        return _res_fn(model, t, xy + v, xyp + cj * v, a)
+
+    return jax.jacfwd(shifted)(jnp.zeros_like(xy))
+
+
+def clear_cache() -> None:
+    """
+    Discard the compiled code that daex caches for solving DAEs.
+
+    The cache is shared by every `SemiExplicitDAE`, so this clears it for all of
+    them. The jitted `derivative` and `constraint` passed by the user have their
+    own caches, which this does not touch.
+    """
+    _res_fn.clear_cache()
+    _jac_fn.clear_cache()
+
+
+class _AdjointState(NamedTuple):
+    x: Float[Array, " x_size"]
+    lam_g: Float[Array, " x_size"]
+    lam_f: Float[Array, " y_size"]
+
+
+class _AdjointParams(NamedTuple):
+    params: Float[Array, " a_size"]
+    yfunc: HermiteSpline
+
+
+@dataclasses.dataclass(frozen=True)
+class _AdjointModel:
+    model: _Model
+    unravel_x: Callable
+    unravel_y: Callable
+    unravel_a: Callable
+    lam_g_size: int
+
+    @property
+    def x_size(self) -> int:
+        return 2 * self.lam_g_size
+
+    def derivative(
+        self, params: _AdjointParams, t: Float[Array, ""], xy: _AdjointState
+    ) -> _AdjointState:
+        a, yfunc = params
+        x, lam_g, lam_f = xy
+        y = yfunc(t)
+
+        _, vjp_deriv = jax.vjp(partial(_deriv_fn, self.model), t, x, y, a)
+        _, vjp_const = jax.vjp(partial(_const_fn, self.model), t, x, y, a)
+        _, _, lam_f_dfdy, _ = vjp_deriv(lam_f)
+        _, _, lam_g_dgdy, _ = vjp_const(lam_g)
+        return _AdjointState(
+            x=None,
+            lam_g=None,
+            lam_f=-lam_f_dfdy + lam_g_dgdy,
+        )
+
+    def constraint(
+        self, params: _AdjointParams, t: Float[Array, ""], xy: _AdjointState
+    ):
+        a, yfunc = params
+        x, lam_g, lam_f = xy
+        y = yfunc(t)
+
+        _, vjp_deriv = jax.vjp(partial(_deriv_fn, self.model), t, x, y, a)
+        g, vjp_const = jax.vjp(partial(_const_fn, self.model), t, x, y, a)
+        _, lam_f_dfdx, _, _ = vjp_deriv(lam_f)
+        _, lam_g_dgdx, _, _ = vjp_const(lam_g)
+        return jnp.concatenate([g, lam_f_dfdx - lam_g_dgdx])
+
+    def da(
+        self,
+        params: _AdjointParams,
+        t: Float[Array, ""],
+        xy: _AdjointState,
+    ) -> jax.Array:
+        a, yfunc = params
+        x, lam_g, lam_f = xy
+        y = yfunc(t)
+
+        _, vjp_deriv = jax.vjp(partial(_deriv_fn, self.model), t, x, y, a)
+        _, vjp_const = jax.vjp(partial(_const_fn, self.model), t, x, y, a)
+        _, _, _, lam_f_dfda = vjp_deriv(lam_f)
+        _, _, _, lam_g_dgda = vjp_const(lam_g)
+        return lam_f_dfda - lam_g_dgda
+
+
+def _make_adjoint(
+    model: _Model,
+    x0: jax.Array,
+    lam_g0: jax.Array,
+    lam_f0: jax.Array,
+    params: _AdjointParams,
+) -> tuple[_AdjointModel, jax.Array, jax.Array, jax.Array]:
+    x = _AdjointState(x=x0, lam_g=lam_g0, lam_f=None)
+    y = _AdjointState(x=None, lam_g=None, lam_f=lam_f0)
+    x, unravel_x = _ravel_pytree(x)
+    y, unravel_y = _ravel_pytree(y)
+    a, unravel_a = _ravel_pytree(params)
+    return (
+        _AdjointModel(
+            model=model,
+            unravel_x=unravel_x,
+            unravel_y=unravel_y,
+            unravel_a=unravel_a,
+            lam_g_size=len(lam_g0),
+        ),
+        x,
+        y,
+        a,
+    )
+
+
+class _ExtendedState(NamedTuple):
+    x: Float[Array, " x_size"]
+    y: Float[Array, " y_size"]
+    z_a: Float[Array, " y_size"]
+    z_y0: Float[Array, " y_size"]
+    z_t0: Float[Array, " y_size"]
+
+
+class _ExtendedParams(NamedTuple):
+    a: Float[Array, " a_size"]
+    da: Float[Array, " a_size"]
+
+
+@dataclasses.dataclass(frozen=True)
+class _ExtendedModel:
+    model: _Model
+    unravel_x: Callable
+    unravel_y: Callable
+    unravel_a: Callable
+
+    @property
+    def x_size(self) -> int:
+        return self.model.x_size
+
+    def derivative(
+        self, params: _ExtendedParams, t: Float[Array, ""], xy: _ExtendedState
+    ) -> _ExtendedState:
+        a, da = params
+        x, y, z_a, z_y0, z_t0 = xy
+        yp = _deriv_fn(self.model, t, x, y, a)
+
+        dfdx, dfdy, dfda = jax.jacrev(
+            partial(_deriv_fn, self.model), argnums=[1, 2, 3]
+        )(t, x, y, a)
+        dgdx, dgdy, dgda = jax.jacrev(
+            partial(_const_fn, self.model), argnums=[1, 2, 3]
+        )(t, x, y, a)
+        lu_dgdx = jsp.linalg.lu_factor(dgdx)
+
+        dxdz_a = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_a)
+        dxdz_y0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_y0)
+        dxdz_t0 = jsp.linalg.lu_solve(lu_dgdx, dgdy @ z_t0)
+        zp_a1 = dfdy @ z_a - dfdx @ dxdz_a
+        zp_y0 = dfdy @ z_y0 - dfdx @ dxdz_y0
+        zp_t0 = dfdy @ z_t0 - dfdx @ dxdz_t0
+
+        dxda = jsp.linalg.lu_solve(lu_dgdx, dgda @ da)
+        zp_a2 = dfda @ da - dfdx @ dxda
+
+        return _ExtendedState(x=None, y=yp, z_a=zp_a1 + zp_a2, z_y0=zp_y0, z_t0=zp_t0)
+
+    def constraint(
+        self, params: _ExtendedParams, t: Float[Array, ""], xy: _ExtendedState
+    ):
+        a, _ = params
+        return _const_fn(self.model, t, xy.x, xy.y, a)
+
+
+def _make_extended(
+    model: _Model,
+    x0: jax.Array,
+    y0: jax.Array,
+    z_a0: jax.Array,
+    z_y0: jax.Array,
+    z_t0: jax.Array,
+    params: _ExtendedParams,
+) -> tuple[_ExtendedModel, jax.Array, jax.Array, jax.Array]:
+    x = _ExtendedState(x=x0, y=None, z_a=None, z_y0=None, z_t0=None)
+    y = _ExtendedState(x=None, y=y0, z_a=z_a0, z_y0=z_y0, z_t0=z_t0)
+    x, unravel_x = _ravel_pytree(x)
+    y, unravel_y = _ravel_pytree(y)
+    a, unravel_a = _ravel_pytree(params)
+    return (
+        _ExtendedModel(
+            model=model,
+            unravel_x=unravel_x,
+            unravel_y=unravel_y,
+            unravel_a=unravel_a,
+        ),
+        x,
+        y,
+        a,
     )
 
 
@@ -337,7 +698,7 @@ def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7))
 def _daeint2(
-    callbacks: SemiExplicitDAE,
+    model: _Model,
     params: Float[Array, " a_size"],
     ts: Float[Array, " points"],
     x0: Float[Array, " x_size"],
@@ -351,13 +712,12 @@ def _daeint2(
     Float[Array, " y_size"],
 ]:
     """Perform DAE integration using IDA."""
-
-    x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
+    x, y, yp = run_forward(model, params, ts, x0, y0, options)
     return x, y, yp
 
 
 def _daeint_fwd2(
-    callbacks: SemiExplicitDAE,
+    model: _Model,
     params: Float[Array, " a_size"],
     ts: Float[Array, " points"],
     x0: Float[Array, " x_size"],
@@ -382,7 +742,7 @@ def _daeint_fwd2(
 ]:
     n = (quad_order + 3) // 2
     ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
-    x, y, yp = run_forward(callbacks, params, ts, x0, y0, options)
+    x, y, yp = run_forward(model, params, ts, x0, y0, options)
     x1 = x[:: n - 1]
     y1 = y[:: n - 1]
     yp1 = yp[:: n - 1]
@@ -390,19 +750,32 @@ def _daeint_fwd2(
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(0, 5))
-def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
-    yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
+def run_forward(model: _Model, params, ts, x0, y0, options: dict):
+    yp0 = _deriv_fn(model, ts[0], x0, y0, params)
     xy = jnp.append(x0, y0)
     xyp = jnp.append(jnp.zeros_like(x0), yp0)
     y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
     yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
 
+    def _residual(t, xy, xyp, res, userdata):
+        t = jnp.asarray(t)
+        xy = jnp.asarray(xy)
+        xyp = jnp.asarray(xyp)
+        res[:] = _res_fn(model, t, xy, xyp, userdata[0])
+
+    def _jacobian(t, xy, xyp, res, cj, JJ, userdata):
+        t = jnp.asarray(t)
+        xy = jnp.asarray(xy)
+        xyp = jnp.asarray(xyp)
+        cj = jnp.asarray(cj)
+        JJ[:, :] = _jac_fn(model, t, xy, xyp, cj, userdata[0])
+
     def _call_ida(params: np.ndarray, ts: np.ndarray, y0: np.ndarray, yp0: np.ndarray):
         ida = _IDA(
-            callbacks.resfn,
-            jacfn=callbacks.jacfn,
+            _residual,
+            jacfn=_jacobian,
             userdata=(params,),
-            algebraic_idx=np.arange(callbacks.x_size),
+            algebraic_idx=np.arange(model.x_size),
             **options,
         )
         results = ida.solve(ts, y0, yp0)
@@ -434,65 +807,26 @@ def run_forward(callbacks: SemiExplicitDAE, params, ts, x0, y0, options: dict):
 
 
 @run_forward.defjvp
-def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents):
+def run_forward_jvp(model: _Model, options: dict, primals, tangents):
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
-    yp0 = callbacks.deriv_fn(params, ts[0], x0, y0)
+    yp0 = _deriv_fn(model, ts[0], x0, y0, params)
     z_a = jnp.zeros_like(y0)
     z_y0 = d_y0
     z_t0 = -yp0 * d_ts[0]
 
-    z0 = jnp.concatenate([y0, z_a, z_y0, z_t0])
-    xy = jnp.append(x0, z0)
-    xyp = jnp.append(
-        jnp.zeros_like(x0), callbacks.deriv_ext((params, d_params), ts[0], x0, z0)
+    ext_model, _x, _y, _a = _make_extended(
+        model, x0, y0, z_a, z_y0, z_t0, _ExtendedParams(params, d_params)
     )
-
-    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xy.shape), xy.dtype)
-    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xyp.shape), xyp.dtype)
-
-    def _call_ida(
-        params: tuple[np.ndarray, np.ndarray],
-        ts: np.ndarray,
-        y0: np.ndarray,
-        yp0: np.ndarray,
-    ):
-        ida = _IDA(
-            callbacks.resfn_ext,
-            jacfn=callbacks.jacfn_ext,
-            userdata=params,
-            algebraic_idx=np.arange(callbacks.x_size),
-            **options,
-        )
-        results = ida.solve(ts, y0, yp0)
-        if not results.success:
-            raise RuntimeError(f"IDA solver failed: {results.message}")
-        if ts.shape[0] == 2:
-            y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
-        else:
-            y = results.y
-            yp = results.yp
-        return y, yp
-
-    xy, xyp = jax.pure_callback(
-        _call_ida,
-        (y_type, yp_type),
-        (params, d_params),
-        ts,
-        xy,
-        xyp,
-        vmap_method="sequential",
-    )
-    x = xy[:, : x0.size]
-    y = xy[:, x0.size :].reshape([ts.size, 4, y0.size])
-    yp = xyp[:, x0.size :].reshape([ts.size, 4, y0.size])
+    x, y, yp = run_forward(ext_model, _a, ts, _x, _y, options)
+    y = y.reshape([ts.size, 4, y0.size])
+    yp = yp.reshape([ts.size, 4, y0.size])
 
     dx, dy, dyp = jax.vmap(
         _finalize_jvp, in_axes=(None, None, None, None, 0, 0, 0, 0, 0)
     )(
-        callbacks.deriv_fn,
-        callbacks.const_fn,
+        lambda a, t, x, y: _deriv_fn(model, t, x, y, a),
+        lambda a, t, x, y: _const_fn(model, t, x, y, a),
         params,
         d_params,
         ts,
@@ -505,7 +839,7 @@ def run_forward_jvp(callbacks: SemiExplicitDAE, options: dict, primals, tangents
 
 
 def _daeint_bwd2(
-    callbacks: SemiExplicitDAE,
+    model: _Model,
     quad_order: int,
     options: dict,
     options_adj: dict,
@@ -540,7 +874,7 @@ def _daeint_bwd2(
     # Point multipliers mu_f, mu_g, mu_y at every ts[k]; mu_y at ts[0] is
     # replaced below by the multiplier of the initial condition.
     mu_f, mu_g, mu_y = jax.vmap(
-        partial(_point_multipliers, callbacks), in_axes=(None, 0, 0, 0, 0, 0, 0)
+        partial(_point_multipliers, model), in_axes=(None, 0, 0, 0, 0, 0, 0)
     )(params, tk, xk, yk, wx, wy, wyp)
 
     def body(j, carry):
@@ -551,7 +885,7 @@ def _daeint_bwd2(
             lam_f1 = mu_y[k] + lam_next
             start = (k - 1) * (n - 1)
             lam_f0, integral = _daeint_bwd_step2(
-                callbacks,
+                model,
                 options_adj,
                 params,
                 jax.lax.dynamic_slice_in_dim(ts, start, n),
@@ -571,7 +905,7 @@ def _daeint_bwd2(
     mu_y = mu_y.at[0].set(-lam_f_t0)
 
     dJdy, dJdt, dJda_point = jax.vmap(
-        partial(_point_vjp, callbacks), in_axes=(None, 0, 0, 0, 0, 0, 0, 0)
+        partial(_point_vjp, model), in_axes=(None, 0, 0, 0, 0, 0, 0, 0)
     )(params, tk, xk, yk, ypk, mu_f, mu_g, mu_y)
     dJda = dJda + jnp.sum(dJda_point, axis=0)
 
@@ -585,7 +919,7 @@ _daeint2.defvjp(_daeint_fwd2, _daeint_bwd2)
 
 
 def _point_multipliers(
-    callbacks: SemiExplicitDAE,
+    model: _Model,
     params: Float[Array, " a_size"],
     t: Float[Array, ""],
     x: Float[Array, " x_size"],
@@ -601,20 +935,20 @@ def _point_multipliers(
         dgdx^T mu_g = -wx + dfdx^T mu_f
         mu_y = -wy + dfdy^T mu_f - dgdy^T mu_g
     """
-    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t, x, y)
-    _, vjp_const = jax.vjp(callbacks.const_fn, params, t, x, y)
-    dgdx = jax.jacfwd(callbacks.const_fn, argnums=2)(params, t, x, y)
+    _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t, x, y, params)
+    _, vjp_const = jax.vjp(partial(_const_fn, model), t, x, y, params)
+    dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t, x, y, params)
 
     mu_f = -wyp
-    _, _, mu_f_dfdx, mu_f_dfdy = vjp_deriv(mu_f)
+    _, mu_f_dfdx, mu_f_dfdy, _ = vjp_deriv(mu_f)
     mu_g = jnp.linalg.solve(dgdx.T, -wx + mu_f_dfdx)
-    _, _, _, mu_g_dgdy = vjp_const(mu_g)
+    _, _, mu_g_dgdy, _ = vjp_const(mu_g)
     mu_y = -wy + mu_f_dfdy - mu_g_dgdy
     return mu_f, mu_g, mu_y
 
 
 def _point_vjp(
-    callbacks: SemiExplicitDAE,
+    model: _Model,
     params: Float[Array, " a_size"],
     t: Float[Array, ""],
     x: Float[Array, " x_size"],
@@ -629,10 +963,10 @@ def _point_vjp(
         dJ/dt_k = -mu_y . yp - mu_f . dfdt + mu_g . dgdt
         -mu_f . dfda + mu_g . dgda  (the point term of dJ/da)
     """
-    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t, x, y)
-    _, vjp_const = jax.vjp(callbacks.const_fn, params, t, x, y)
-    mu_f_dfda, mu_f_dfdt, _, mu_f_dfdy = vjp_deriv(mu_f)
-    mu_g_dgda, mu_g_dgdt, _, mu_g_dgdy = vjp_const(mu_g)
+    _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t, x, y, params)
+    _, vjp_const = jax.vjp(partial(_const_fn, model), t, x, y, params)
+    mu_f_dfdt, _, mu_f_dfdy, mu_f_dfda = vjp_deriv(mu_f)
+    mu_g_dgdt, _, mu_g_dgdy, mu_g_dgda = vjp_const(mu_g)
     dJdy = -mu_f_dfdy + mu_g_dgdy
     dJdt = -jnp.dot(mu_y, yp) - mu_f_dfdt + mu_g_dgdt
     dJda = -mu_f_dfda + mu_g_dgda
@@ -640,7 +974,7 @@ def _point_vjp(
 
 
 def _daeint_bwd_step2(
-    callbacks: SemiExplicitDAE,
+    model: _Model,
     options: dict,
     params: Float[Array, " a_size"],
     ts: Float[Array, " quad_order"],
@@ -656,69 +990,27 @@ def _daeint_bwd_step2(
     lambda_f^T dfda - lambda_g^T dgda over the interval.
     """
     yfunc = HermiteSpline(ts, y, yp)
-    lam_g, lam_f = run_adjoint(callbacks, yfunc, params, ts, x[-1], lam_f1, options)
+    adj_params = _AdjointParams(params, yfunc)
+
+    t1 = ts[-1]
+    x1 = x[-1]
+    y1 = y[-1]
+    _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t1, x1, y1, params)
+    dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t1, x1, y1, params)
+    lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
+
+    adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
+    _x, _y, _yp = run_forward(adj_model, _a, ts[::-1], _x, _y, options)
+
+    xy = jax.vmap(
+        lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
+    )(_x[::-1], _y[::-1])
 
     with jax.profiler.TraceAnnotation("daeint:integrate_da"):
-        integrand = jax.vmap(callbacks.da_fn, in_axes=(None, 0, 0, 0, 0, 0))(
-            params, ts, x, y, lam_g, lam_f
-        )
+        integrand = jax.vmap(adj_model.da, in_axes=(None, 0, 0))(adj_params, ts, xy)
         integral = jnp.dot(ws, integrand)
 
-    return lam_f[0], integral
-
-
-def run_adjoint(
-    callbacks: SemiExplicitDAE, yfunc, params, ts, x1, lam_f1, options: dict
-):
-    t1 = ts[-1]
-    y1 = yfunc(t1)
-    _, vjp_deriv = jax.vjp(callbacks.deriv_fn, params, t1, x1, y1)
-    dgdx = jax.jacfwd(callbacks.const_fn, argnums=2)(params, t1, x1, y1)
-    lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[2])
-    lam_fp1 = callbacks.deriv_adj(params, t1, x1, y1, lam_g1, lam_f1)
-    xz = jnp.concatenate([x1, lam_g1, lam_f1])
-    xzp = jnp.concatenate([jnp.zeros_like(x1), jnp.zeros_like(lam_g1), lam_fp1])
-
-    y_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xz.shape), xz.dtype)
-    yp_type = jax.ShapeDtypeStruct(list(ts.shape) + list(xzp.shape), xzp.dtype)
-
-    def _call_ida(
-        params: tuple[np.ndarray, HermiteSpline],
-        ts: np.ndarray,
-        y0: np.ndarray,
-        yp0: np.ndarray,
-    ):
-        ida = _IDA(
-            callbacks.resfn_adj,
-            jacfn=callbacks.jacfn_adj,
-            userdata=params,
-            algebraic_idx=np.arange(2 * callbacks.x_size),
-            **options,
-        )
-        results = ida.solve(ts, y0, yp0)
-        if not results.success:
-            raise RuntimeError(f"IDA solver failed: {results.message}")
-        if ts.shape[0] == 2:
-            y = np.take(results.y, np.array([0, -1]), axis=0)
-            yp = np.take(results.y, np.array([0, -1]), axis=0)
-        else:
-            y = results.y
-            yp = results.yp
-        return y, yp
-
-    xz, xzp = jax.pure_callback(
-        _call_ida,
-        (y_type, yp_type),
-        (params, yfunc),
-        ts[::-1],
-        xz,
-        xzp,
-        vmap_method="sequential",
-    )
-    lam_g = xz[:, x1.size : 2 * x1.size]
-    lam_f = xz[:, 2 * x1.size :]
-
-    return lam_g[::-1], lam_f[::-1]
+    return xy.lam_f[0], integral
 
 
 def daeint[Params, Var](
@@ -743,22 +1035,22 @@ def daeint[Params, Var](
         raise NotImplementedError("quad_order must be odd.")
 
     x0, y0 = dae.partition(xy0)
-    x, unravel_x = ravel_pytree(x0)
-    y, unravel_y = ravel_pytree(y0)
-    a, _ = ravel_pytree(params)
+    model, x, y, a = _make_model(dae, x0, y0, params)
+    unravel_x = model.unravel_x
+    unravel_y = model.unravel_y
 
-    x, y, yp = _daeint2(dae, a, ts, x, y, quad_order, options, options_adj)
+    x, y, yp = _daeint2(model, a, ts, x, y, quad_order, options, options_adj)
 
     with jax.profiler.TraceAnnotation("daeint:calc_dxdt"):
 
         def for_each(a, t, x, y, yp):
-            dgdx = jax.jacfwd(dae.const_fn, argnums=2)(a, t, x, y)
+            dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t, x, y, a)
             dxdt = -jnp.linalg.solve(
                 dgdx,
                 jax.jvp(
-                    dae.const_fn,
-                    (a, t, x, y),
-                    (jnp.zeros_like(a), jnp.ones_like(t), jnp.zeros_like(x), yp),
+                    partial(_const_fn, model),
+                    (t, x, y, a),
+                    (jnp.ones_like(t), jnp.zeros_like(x), yp, jnp.zeros_like(a)),
                 )[1],
             )
             return dxdt
@@ -873,13 +1165,13 @@ def adjoint[Params, Var](
     """
     solution_values, solution_derivative = solution
     cotangent_values, cotangent_derivative = cotangent
-    a, _ = ravel_pytree(params)
 
     x0_sample, y0_sample = dae.partition(
         jax.tree.map(lambda leaf: leaf[0], solution_values)
     )
-    _, unravel_x = ravel_pytree(x0_sample)
-    _, unravel_y = ravel_pytree(y0_sample)
+    model, _, _, a = _make_model(dae, x0_sample, y0_sample, params)
+    unravel_x = model.unravel_x
+    unravel_y = model.unravel_y
 
     def ravel_xy(xy: Var) -> tuple[jax.Array, jax.Array]:
         x0, y0 = dae.partition(xy)
@@ -900,7 +1192,7 @@ def adjoint[Params, Var](
 
     # Point multipliers mu_f, mu_g, mu_y at every ts[k].
     mu_f, mu_g, mu_y = jax.vmap(
-        partial(_point_multipliers, dae), in_axes=(None, 0, 0, 0, 0, 0, 0)
+        partial(_point_multipliers, model), in_axes=(None, 0, 0, 0, 0, 0, 0)
     )(a, ts, x, y, wx, wy, wyp)
     mu_y_r = mu_y[::-1]
 
@@ -915,14 +1207,23 @@ def adjoint[Params, Var](
         interval_y = jnp.stack([y_r[i], y_r[i - 1]])
         interval_yp = jnp.stack([yp_r[i], yp_r[i - 1]])
         yfunc = HermiteSpline(interval_ts, interval_y, interval_yp)
+        adj_params = _AdjointParams(a, yfunc)
         # Jump condition: lambda_f(ts[k]-) = mu_y at ts[k] + lambda_f(ts[k]+)
         lam_f1 = mu_y_r[i - 1] + lam_next
-        lam_g, lam_f = run_adjoint(
-            dae, yfunc, a, interval_ts, x_r[i - 1], lam_f1, options
-        )
-        lam_g_r = lam_g_r.at[i - 1].set(lam_g)
-        lam_f_r = lam_f_r.at[i - 1].set(lam_f)
-        return lam_f[0], lam_g_r, lam_f_r
+        t1, x1, y1 = ts_r[i - 1], x_r[i - 1], y_r[i - 1]
+        _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t1, x1, y1, a)
+        dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t1, x1, y1, a)
+        lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
+
+        adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
+        _x, _y, _ = run_forward(adj_model, _a, interval_ts[::-1], _x, _y, options)
+        xy = jax.vmap(
+            lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
+        )(_x[::-1], _y[::-1])
+
+        lam_g_r = lam_g_r.at[i - 1].set(xy.lam_g)
+        lam_f_r = lam_f_r.at[i - 1].set(xy.lam_f)
+        return xy.lam_f[0], lam_g_r, lam_f_r
 
     # lambda_{f,K+1}(ts[-1]) = 0
     _, lam_g_r, lam_f_r = jax.lax.fori_loop(
