@@ -479,6 +479,18 @@ def _jac_fn(
     return jax.jacfwd(shifted)(jnp.zeros_like(xy))
 
 
+def clear_cache() -> None:
+    """
+    Discard the compiled code that daex caches for solving DAEs.
+
+    The cache is shared by every `SemiExplicitDAE`, so this clears it for all of
+    them. The jitted `derivative` and `constraint` passed by the user have their
+    own caches, which this does not touch.
+    """
+    _res_fn.clear_cache()
+    _jac_fn.clear_cache()
+
+
 class _AdjointState(NamedTuple):
     x: Float[Array, " x_size"]
     lam_g: Float[Array, " x_size"]

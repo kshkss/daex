@@ -14,6 +14,7 @@ from daex.semi_explicit import (
     _make_model,
     _ravel_pytree,
     _res_fn,
+    clear_cache,
     def_semi_explicit_dae,
 )
 
@@ -139,3 +140,19 @@ def test_unravel_of_empty_pytree_is_comparable():
     assert unravel1 == unravel2
     assert hash(unravel1) == hash(unravel2)
     assert unravel1(jnp.zeros(0)) == State(x=None, y=None)
+
+
+def test_clear_cache():
+    params, t0, xy0 = make_problem()
+    dae = def_semi_explicit_dae(derivative, constraint, params, t0, xy0)
+    call_model_fns(dae, params, t0, xy0)
+    assert _res_fn._cache_size() > 0
+    assert _jac_fn._cache_size() > 0
+
+    clear_cache()
+    assert _res_fn._cache_size() == 0
+    assert _jac_fn._cache_size() == 0
+
+    call_model_fns(dae, params, t0, xy0)
+    assert _res_fn._cache_size() == 1
+    assert _jac_fn._cache_size() == 1
