@@ -764,7 +764,7 @@ def _daeint2(
     y0: Float[Array, " y_size"],
     quad_order: int,
     options: dict,
-    options_sdj: dict,
+    options_adj: dict,
     mode: Mode = "reverse",
 ) -> tuple[
     Float[Array, " x_size"],
@@ -784,7 +784,7 @@ def _daeint_fwd2(
     y0: Float[Array, " y_size"],
     quad_order: int,
     options: dict,
-    options_sdj: dict,
+    options_adj: dict,
     mode: Mode = "reverse",
 ) -> tuple[
     tuple[
@@ -803,7 +803,18 @@ def _daeint_fwd2(
 ]:
     n = (quad_order + 3) // 2
     ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
-    x, y, yp = run_forward(model, params, ts, x0, y0, options)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        "options_adj": options_adj,
+        "mode": mode,
+    }
+    if mode == "reverse":
+        x, y, yp = _daeint2(model, params, ts, x0, y0, **kwargs)
+    elif mode in ("reverse_forward", "alternating"):
+        x, y, yp = run_forward(model, params, ts, x0, y0, **kwargs)
+    else:
+        raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
     x1 = x[:: n - 1]
     y1 = y[:: n - 1]
     yp1 = yp[:: n - 1]
@@ -820,7 +831,7 @@ def run_forward(
     options: dict,
     quad_order: int = 5,
     options_adj: dict = {},
-    mode: Mode = "reverse",
+    mode: Mode = "forward",
 ):
     """Perform DAE integration using IDA."""
     x, y, yp = _run_forward(model, params, ts, x0, y0, options)
@@ -847,7 +858,18 @@ def run_forward_jvp(
     ext_model, _x, _y, _a = _make_extended(
         model, x0, y0, z_a, z_y0, z_t0, _ExtendedParams(params, d_params)
     )
-    x, y, yp = run_forward(ext_model, _a, ts, _x, _y, options)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        "options_adj": options_adj,
+        "mode": mode,
+    }
+    if mode in ("forward", "reverse_forward"):
+        x, y, yp = run_forward(ext_model, _a, ts, _x, _y, **kwargs)
+    elif mode == "alternating":
+        x, y, yp = _daeint2(ext_model, _a, ts, _x, _y, **kwargs)
+    else:
+        raise ValueError(f"Unexpected mode in forward-mode rule: {mode!r}")
     y = y.reshape([ts.size, 4, y0.size])
     yp = yp.reshape([ts.size, 4, y0.size])
 
@@ -924,6 +946,8 @@ def _daeint_bwd2(
                 jax.lax.dynamic_slice_in_dim(y, start, n),
                 jax.lax.dynamic_slice_in_dim(yp, start, n),
                 lam_f1,
+                quad_order=quad_order,
+                mode=mode,
             )
             return lam_f0, dJda - integral
 
@@ -1013,6 +1037,7 @@ def _daeint_bwd_step2(
     y: Float[Array, "quad_order y_size"],
     yp: Float[Array, "quad_order y_size"],
     lam_f1: Float[Array, " y_size"],
+    quad_order: int = 5,
     mode: Mode = "reverse",
 ) -> tuple[Float[Array, " y_size"], Float[Array, " a_size"]]:
     """
@@ -1031,7 +1056,18 @@ def _daeint_bwd_step2(
     lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
 
     adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
-    _x, _y, _yp = run_forward(adj_model, _a, ts[::-1], _x, _y, options)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        "options_adj": options,
+        "mode": mode,
+    }
+    if mode == "reverse":
+        _x, _y, _yp = _daeint2(adj_model, _a, ts[::-1], _x, _y, **kwargs)
+    elif mode in ("reverse_forward", "alternating"):
+        _x, _y, _yp = run_forward(adj_model, _a, ts[::-1], _x, _y, **kwargs)
+    else:
+        raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
 
     xy = jax.vmap(
         lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
@@ -1059,9 +1095,13 @@ def daeint[Params, Var](
     Interface of SUNDIALS IDA solver for systems defined as
 
     Args:
-    - mode (str): Differentiation mode, one of "forward", "reverse",
-      "reverse_forward" or "alternating". Default is "reverse".
-      Not used yet: every mode currently takes the reverse path.
+    - mode (str): Differentiation mode. Default is "reverse".
+      - "forward": every order of differentiation uses forward-mode rules.
+      - "reverse": every order of differentiation uses reverse-mode rules.
+      - "reverse_forward": first order reverse, higher orders forward.
+      - "alternating": first order reverse, then forward and reverse
+        alternately at each higher order.
+      Any other value raises ValueError.
     - options (dict): Additional options for the solver.
     """
     if quad_order < 0:
@@ -1074,7 +1114,18 @@ def daeint[Params, Var](
     unravel_x = model.unravel_x
     unravel_y = model.unravel_y
 
-    x, y, yp = _daeint2(model, a, ts, x, y, quad_order, options, options_adj)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        "options_adj": options_adj,
+        "mode": mode,
+    }
+    if mode == "forward":
+        x, y, yp = run_forward(model, a, ts, x, y, **kwargs)
+    elif mode in ("reverse", "reverse_forward", "alternating"):
+        x, y, yp = _daeint2(model, a, ts, x, y, **kwargs)
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}")
 
     with jax.profiler.TraceAnnotation("daeint:calc_dxdt"):
 
