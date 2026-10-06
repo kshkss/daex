@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Callable, Any, NamedTuple, Protocol, runtime_checkable
+from typing import Callable, Any, Literal, NamedTuple, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
@@ -336,6 +336,9 @@ def _legacy_callbacks(
         da_fn=da_fn,
         _clear_cache=clear_cache,
     )
+
+
+Mode = Literal["forward", "reverse", "reverse_forward", "alternating"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -696,7 +699,7 @@ def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
     return (dx, dy, dyp)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7))
+@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7, 8))
 def _daeint2(
     model: _Model,
     params: Float[Array, " a_size"],
@@ -706,6 +709,7 @@ def _daeint2(
     quad_order: int,
     options: dict,
     options_sdj: dict,
+    mode: Mode = "reverse",
 ) -> tuple[
     Float[Array, " x_size"],
     Float[Array, " y_size"],
@@ -725,6 +729,7 @@ def _daeint_fwd2(
     quad_order: int,
     options: dict,
     options_sdj: dict,
+    mode: Mode = "reverse",
 ) -> tuple[
     tuple[
         Float[Array, "points x_size"],
@@ -749,8 +754,10 @@ def _daeint_fwd2(
     return (x1, y1, yp1), (params, ts, ws, x, y, yp)
 
 
-@partial(jax.custom_jvp, nondiff_argnums=(0, 5))
-def run_forward(model: _Model, params, ts, x0, y0, options: dict):
+@partial(jax.custom_jvp, nondiff_argnums=(0, 5, 6))
+def run_forward(
+    model: _Model, params, ts, x0, y0, options: dict, mode: Mode = "reverse"
+):
     yp0 = _deriv_fn(model, ts[0], x0, y0, params)
     xy = jnp.append(x0, y0)
     xyp = jnp.append(jnp.zeros_like(x0), yp0)
@@ -807,7 +814,7 @@ def run_forward(model: _Model, params, ts, x0, y0, options: dict):
 
 
 @run_forward.defjvp
-def run_forward_jvp(model: _Model, options: dict, primals, tangents):
+def run_forward_jvp(model: _Model, options: dict, mode: Mode, primals, tangents):
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
     yp0 = _deriv_fn(model, ts[0], x0, y0, params)
@@ -843,6 +850,7 @@ def _daeint_bwd2(
     quad_order: int,
     options: dict,
     options_adj: dict,
+    mode: Mode,
     residuals: tuple[
         Float[Array, " a_size"],
         Float[Array, " interpolated"],
@@ -983,6 +991,7 @@ def _daeint_bwd_step2(
     y: Float[Array, "quad_order y_size"],
     yp: Float[Array, "quad_order y_size"],
     lam_f1: Float[Array, " y_size"],
+    mode: Mode = "reverse",
 ) -> tuple[Float[Array, " y_size"], Float[Array, " a_size"]]:
     """
     Solve the adjoint DAE backward over one interval [ts[0], ts[-1]] from
@@ -1019,6 +1028,7 @@ def daeint[Params, Var](
     ts: Float[Array, " _"],
     xy0: Var,
     *,
+    mode: Mode = "reverse",
     quad_order=5,
     options: dict = {},
     options_adj: dict = {},
@@ -1027,6 +1037,9 @@ def daeint[Params, Var](
     Interface of SUNDIALS IDA solver for systems defined as
 
     Args:
+    - mode (str): Differentiation mode, one of "forward", "reverse",
+      "reverse_forward" or "alternating". Default is "reverse".
+      Not used yet: every mode currently takes the reverse path.
     - options (dict): Additional options for the solver.
     """
     if quad_order < 0:
