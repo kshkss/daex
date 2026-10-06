@@ -699,65 +699,7 @@ def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
     return (dx, dy, dyp)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7, 8))
-def _daeint2(
-    model: _Model,
-    params: Float[Array, " a_size"],
-    ts: Float[Array, " points"],
-    x0: Float[Array, " x_size"],
-    y0: Float[Array, " y_size"],
-    quad_order: int,
-    options: dict,
-    options_sdj: dict,
-    mode: Mode = "reverse",
-) -> tuple[
-    Float[Array, " x_size"],
-    Float[Array, " y_size"],
-    Float[Array, " y_size"],
-]:
-    """Perform DAE integration using IDA."""
-    x, y, yp = run_forward(model, params, ts, x0, y0, options)
-    return x, y, yp
-
-
-def _daeint_fwd2(
-    model: _Model,
-    params: Float[Array, " a_size"],
-    ts: Float[Array, " points"],
-    x0: Float[Array, " x_size"],
-    y0: Float[Array, " y_size"],
-    quad_order: int,
-    options: dict,
-    options_sdj: dict,
-    mode: Mode = "reverse",
-) -> tuple[
-    tuple[
-        Float[Array, "points x_size"],
-        Float[Array, "points y_size"],
-        Float[Array, "points y_size"],
-    ],
-    tuple[
-        Float[Array, " a_size"],
-        Float[Array, " interpolated"],
-        Float[Array, "n_intervals quad_order"],
-        Float[Array, "interpolated x_size"],
-        Float[Array, "interpolated y_size"],
-        Float[Array, "interpolated y_size"],
-    ],
-]:
-    n = (quad_order + 3) // 2
-    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
-    x, y, yp = run_forward(model, params, ts, x0, y0, options)
-    x1 = x[:: n - 1]
-    y1 = y[:: n - 1]
-    yp1 = yp[:: n - 1]
-    return (x1, y1, yp1), (params, ts, ws, x, y, yp)
-
-
-@partial(jax.custom_jvp, nondiff_argnums=(0, 5, 6))
-def run_forward(
-    model: _Model, params, ts, x0, y0, options: dict, mode: Mode = "reverse"
-):
+def _run_forward(model: _Model, params, ts, x0, y0, options: dict):
     yp0 = _deriv_fn(model, ts[0], x0, y0, params)
     xy = jnp.append(x0, y0)
     xyp = jnp.append(jnp.zeros_like(x0), yp0)
@@ -813,8 +755,88 @@ def run_forward(
     return x, y, yp
 
 
+@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7, 8))
+def _daeint2(
+    model: _Model,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " points"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+    quad_order: int,
+    options: dict,
+    options_sdj: dict,
+    mode: Mode = "reverse",
+) -> tuple[
+    Float[Array, " x_size"],
+    Float[Array, " y_size"],
+    Float[Array, " y_size"],
+]:
+    """Perform DAE integration using IDA."""
+    x, y, yp = _run_forward(model, params, ts, x0, y0, options)
+    return x, y, yp
+
+
+def _daeint_fwd2(
+    model: _Model,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " points"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+    quad_order: int,
+    options: dict,
+    options_sdj: dict,
+    mode: Mode = "reverse",
+) -> tuple[
+    tuple[
+        Float[Array, "points x_size"],
+        Float[Array, "points y_size"],
+        Float[Array, "points y_size"],
+    ],
+    tuple[
+        Float[Array, " a_size"],
+        Float[Array, " interpolated"],
+        Float[Array, "n_intervals quad_order"],
+        Float[Array, "interpolated x_size"],
+        Float[Array, "interpolated y_size"],
+        Float[Array, "interpolated y_size"],
+    ],
+]:
+    n = (quad_order + 3) // 2
+    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
+    x, y, yp = run_forward(model, params, ts, x0, y0, options)
+    x1 = x[:: n - 1]
+    y1 = y[:: n - 1]
+    yp1 = yp[:: n - 1]
+    return (x1, y1, yp1), (params, ts, ws, x, y, yp)
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0, 5, 6, 7, 8))
+def run_forward(
+    model: _Model,
+    params,
+    ts,
+    x0,
+    y0,
+    options: dict,
+    quad_order: int = 5,
+    options_adj: dict = {},
+    mode: Mode = "reverse",
+):
+    """Perform DAE integration using IDA."""
+    x, y, yp = _run_forward(model, params, ts, x0, y0, options)
+    return x, y, yp
+
+
 @run_forward.defjvp
-def run_forward_jvp(model: _Model, options: dict, mode: Mode, primals, tangents):
+def run_forward_jvp(
+    model: _Model,
+    options: dict,
+    quad_order: int,
+    options_adj: dict,
+    mode: Mode,
+    primals,
+    tangents,
+):
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
     yp0 = _deriv_fn(model, ts[0], x0, y0, params)
