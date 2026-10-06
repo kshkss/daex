@@ -65,6 +65,11 @@ def assert_allclose_tree(a, b):
     assert all(matches), (a, b)
 
 
+def test_invalid_mode_raises(dae, params, ts, y0):
+    with pytest.raises(ValueError):
+        daeint(params, dae, ts, y0, mode="bogus")
+
+
 def test_reverse_mode_matches_analytic_gradient(dae, params, ts, y0):
     def loss(params, ts, y0):
         u, _ = daeint(
@@ -122,6 +127,27 @@ def test_default_mode_is_reverse(dae, params, ts, y0):
     grad_default = jax.grad(loss_default, argnums=[0, 1, 2])(params, ts, y0)
     grad_reverse = jax.grad(loss_reverse, argnums=[0, 1, 2])(params, ts, y0)
     assert_allclose_tree(grad_default, grad_reverse)
+
+
+@pytest.mark.parametrize("tangent_index", range(14))
+def test_forward_mode_matches_analytic_gradient(dae, params, ts, y0, tangent_index):
+    def loss(params, ts, y0):
+        u, _ = daeint(params, dae, ts, y0, mode="forward")
+        return u.y[-1]
+
+    def loss_acc(params, ts, y0):
+        u = analytic(params, ts, y0)
+        return u.y[-1]
+
+    primals = (params, ts, y0)
+    flat, unravel = ravel_pytree(primals)
+    tangents = unravel(jnp.zeros_like(flat).at[tangent_index].set(1.0))
+
+    _, tangent_out = jax.jvp(loss, primals, tangents)
+    grad_acc = jax.grad(loss_acc, argnums=[0, 1, 2])(params, ts, y0)
+    grad_acc_flat, _ = ravel_pytree(grad_acc)
+
+    assert jnp.allclose(tangent_out, grad_acc_flat[tangent_index], 1e-4, 1e-4)
 
 
 def test_reverse_forward_mode_first_order_matches_analytic_gradient(
