@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from daex.semi_explicit import _make_model, def_semi_explicit_dae, run_forward
+from daex.semi_explicit import _make_model, def_semi_explicit_dae, _forward_mode
 
 jax.config.update("jax_enable_x64", True)
 
@@ -40,7 +40,7 @@ def problem(request):
 
     def forward(a, ts, y):
         # x0 = sqrt(y0) keeps the initial condition consistent with constraint.
-        return run_forward(model, a, ts, jnp.sqrt(y), y, {})
+        return _forward_mode(model, a, ts, jnp.sqrt(y), y, {})
 
     return forward, a, ts, y
 

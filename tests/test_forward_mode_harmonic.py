@@ -37,7 +37,7 @@ def analytic(params: Params, ts: jax.Array, stat0: State) -> State:
     def result(params: Params, t: jax.Array, t0: jax.Array, stat0: State):
         # x is algebraic (slaved to y via x**2 + y**2 == RADIUS**2), so only
         # stat0.y determines the trajectory's phase; stat0.x has no effect,
-        # matching how run_forward_jvp discards the tangent of the
+        # matching how _forward_mode_jvp discards the tangent of the
         # algebraic initial condition.
         phase0 = jnp.arccos(stat0.y / RADIUS)
         phase = params.a * (t - t0) + phase0

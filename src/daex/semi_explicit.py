@@ -756,7 +756,7 @@ def _run_forward(model: _Model, params, ts, x0, y0, options: dict):
 
 
 @partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7, 8))
-def _daeint2(
+def _reverse_mode(
     model: _Model,
     params: Float[Array, " a_size"],
     ts: Float[Array, " points"],
@@ -776,7 +776,7 @@ def _daeint2(
     return x, y, yp
 
 
-def _daeint_fwd2(
+def _reverse_mode_fwd(
     model: _Model,
     params: Float[Array, " a_size"],
     ts: Float[Array, " points"],
@@ -810,9 +810,9 @@ def _daeint_fwd2(
         "mode": mode,
     }
     if mode == "reverse":
-        x, y, yp = _daeint2(model, params, ts, x0, y0, **kwargs)
+        x, y, yp = _reverse_mode(model, params, ts, x0, y0, **kwargs)
     elif mode in ("reverse_forward", "alternating"):
-        x, y, yp = run_forward(model, params, ts, x0, y0, **kwargs)
+        x, y, yp = _forward_mode(model, params, ts, x0, y0, **kwargs)
     else:
         raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
     x1 = x[:: n - 1]
@@ -822,7 +822,7 @@ def _daeint_fwd2(
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(0, 5, 6, 7, 8))
-def run_forward(
+def _forward_mode(
     model: _Model,
     params,
     ts,
@@ -838,8 +838,8 @@ def run_forward(
     return x, y, yp
 
 
-@run_forward.defjvp
-def run_forward_jvp(
+@_forward_mode.defjvp
+def _forward_mode_jvp(
     model: _Model,
     options: dict,
     quad_order: int,
@@ -865,9 +865,9 @@ def run_forward_jvp(
         "mode": mode,
     }
     if mode in ("forward", "reverse_forward"):
-        x, y, yp = run_forward(ext_model, _a, ts, _x, _y, **kwargs)
+        x, y, yp = _forward_mode(ext_model, _a, ts, _x, _y, **kwargs)
     elif mode == "alternating":
-        x, y, yp = _daeint2(ext_model, _a, ts, _x, _y, **kwargs)
+        x, y, yp = _reverse_mode(ext_model, _a, ts, _x, _y, **kwargs)
     else:
         raise ValueError(f"Unexpected mode in forward-mode rule: {mode!r}")
     y = y.reshape([ts.size, 4, y0.size])
@@ -889,7 +889,7 @@ def run_forward_jvp(
     return (x, y[:, 0, :], yp[:, 0, :]), (dx, dy, dyp)
 
 
-def _daeint_bwd2(
+def _reverse_mode_bwd(
     model: _Model,
     quad_order: int,
     options: dict,
@@ -969,7 +969,7 @@ def _daeint_bwd2(
     return (dJda, dJdt, None, dJdy0)
 
 
-_daeint2.defvjp(_daeint_fwd2, _daeint_bwd2)
+_reverse_mode.defvjp(_reverse_mode_fwd, _reverse_mode_bwd)
 
 
 def _point_multipliers(
@@ -1063,9 +1063,9 @@ def _daeint_bwd_step2(
         "mode": mode,
     }
     if mode == "reverse":
-        _x, _y, _yp = _daeint2(adj_model, _a, ts[::-1], _x, _y, **kwargs)
+        _x, _y, _yp = _reverse_mode(adj_model, _a, ts[::-1], _x, _y, **kwargs)
     elif mode in ("reverse_forward", "alternating"):
-        _x, _y, _yp = run_forward(adj_model, _a, ts[::-1], _x, _y, **kwargs)
+        _x, _y, _yp = _forward_mode(adj_model, _a, ts[::-1], _x, _y, **kwargs)
     else:
         raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
 
@@ -1121,9 +1121,9 @@ def daeint[Params, Var](
         "mode": mode,
     }
     if mode == "forward":
-        x, y, yp = run_forward(model, a, ts, x, y, **kwargs)
+        x, y, yp = _forward_mode(model, a, ts, x, y, **kwargs)
     elif mode in ("reverse", "reverse_forward", "alternating"):
-        x, y, yp = _daeint2(model, a, ts, x, y, **kwargs)
+        x, y, yp = _reverse_mode(model, a, ts, x, y, **kwargs)
     else:
         raise ValueError(f"Unknown mode: {mode!r}")
 
@@ -1302,7 +1302,7 @@ def adjoint[Params, Var](
         lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
 
         adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
-        _x, _y, _ = run_forward(adj_model, _a, interval_ts[::-1], _x, _y, options)
+        _x, _y, _ = _forward_mode(adj_model, _a, interval_ts[::-1], _x, _y, options)
         xy = jax.vmap(
             lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
         )(_x[::-1], _y[::-1])
