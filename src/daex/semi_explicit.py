@@ -886,7 +886,13 @@ def _reverse_mode_fwd(
     x1 = x[:: n - 1]
     y1 = y[:: n - 1]
     yp1 = yp[:: n - 1]
-    return (x1, y1, yp1), (params, ts, ws, x, y, yp)
+    # Do not return an input as-is as a residual. JAX forwards such residuals
+    # from the inputs by index, but the partial evaluation of scan
+    # (JaxprTrace.process_custom_vjp_call) prepends constants to the inputs
+    # without shifting the indices, so the bwd rule receives a wrong value
+    # (seen in third-order reverse mode). `+ 0.0` makes `params` a distinct
+    # value to avoid it.
+    return (x1, y1, yp1), (params + 0.0, ts, ws, x, y, yp)
 
 
 def _reverse_mode_bwd(
