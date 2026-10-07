@@ -150,6 +150,20 @@ def test_forward_mode_matches_analytic_gradient(dae, params, ts, y0, tangent_ind
     assert jnp.allclose(tangent_out, grad_acc_flat[tangent_index], 1e-4, 1e-4)
 
 
+def test_reverse_mode_second_order_matches_analytic_hessian(dae, params, ts, y0):
+    def loss(params, ts, y0):
+        u, _ = daeint(params, dae, ts, y0, mode="reverse")
+        return u.y[-1]
+
+    def loss_acc(params, ts, y0):
+        u = analytic(params, ts, y0)
+        return u.y[-1]
+
+    hess = jax.jacrev(jax.grad(loss, argnums=0))(params, ts, y0)
+    hess_acc = jax.jacrev(jax.grad(loss_acc, argnums=0))(params, ts, y0)
+    assert_allclose_tree(hess, hess_acc)
+
+
 def test_reverse_forward_mode_first_order_matches_analytic_gradient(
     dae, params, ts, y0
 ):
