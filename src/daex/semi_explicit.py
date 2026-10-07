@@ -755,72 +755,6 @@ def _run_forward(model: _Model, params, ts, x0, y0, options: dict):
     return x, y, yp
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7, 8))
-def _reverse_mode(
-    model: _Model,
-    params: Float[Array, " a_size"],
-    ts: Float[Array, " points"],
-    x0: Float[Array, " x_size"],
-    y0: Float[Array, " y_size"],
-    quad_order: int,
-    options: dict,
-    options_adj: dict,
-    mode: Mode = "reverse",
-) -> tuple[
-    Float[Array, " x_size"],
-    Float[Array, " y_size"],
-    Float[Array, " y_size"],
-]:
-    """Perform DAE integration using IDA."""
-    x, y, yp = _run_forward(model, params, ts, x0, y0, options)
-    return x, y, yp
-
-
-def _reverse_mode_fwd(
-    model: _Model,
-    params: Float[Array, " a_size"],
-    ts: Float[Array, " points"],
-    x0: Float[Array, " x_size"],
-    y0: Float[Array, " y_size"],
-    quad_order: int,
-    options: dict,
-    options_adj: dict,
-    mode: Mode = "reverse",
-) -> tuple[
-    tuple[
-        Float[Array, "points x_size"],
-        Float[Array, "points y_size"],
-        Float[Array, "points y_size"],
-    ],
-    tuple[
-        Float[Array, " a_size"],
-        Float[Array, " interpolated"],
-        Float[Array, "n_intervals quad_order"],
-        Float[Array, "interpolated x_size"],
-        Float[Array, "interpolated y_size"],
-        Float[Array, "interpolated y_size"],
-    ],
-]:
-    n = (quad_order + 3) // 2
-    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
-    kwargs = {
-        "quad_order": quad_order,
-        "options": options,
-        "options_adj": options_adj,
-        "mode": mode,
-    }
-    if mode == "reverse":
-        x, y, yp = _reverse_mode(model, params, ts, x0, y0, **kwargs)
-    elif mode in ("reverse_forward", "alternating"):
-        x, y, yp = _forward_mode(model, params, ts, x0, y0, **kwargs)
-    else:
-        raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
-    x1 = x[:: n - 1]
-    y1 = y[:: n - 1]
-    yp1 = yp[:: n - 1]
-    return (x1, y1, yp1), (params, ts, ws, x, y, yp)
-
-
 @partial(jax.custom_jvp, nondiff_argnums=(0, 5, 6, 7, 8))
 def _forward_mode(
     model: _Model,
@@ -887,6 +821,72 @@ def _forward_mode_jvp(
         yp,
     )
     return (x, y[:, 0, :], yp[:, 0, :]), (dx, dy, dyp)
+
+
+@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7, 8))
+def _reverse_mode(
+    model: _Model,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " points"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+    quad_order: int,
+    options: dict,
+    options_adj: dict,
+    mode: Mode = "reverse",
+) -> tuple[
+    Float[Array, " x_size"],
+    Float[Array, " y_size"],
+    Float[Array, " y_size"],
+]:
+    """Perform DAE integration using IDA."""
+    x, y, yp = _run_forward(model, params, ts, x0, y0, options)
+    return x, y, yp
+
+
+def _reverse_mode_fwd(
+    model: _Model,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " points"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+    quad_order: int,
+    options: dict,
+    options_adj: dict,
+    mode: Mode = "reverse",
+) -> tuple[
+    tuple[
+        Float[Array, "points x_size"],
+        Float[Array, "points y_size"],
+        Float[Array, "points y_size"],
+    ],
+    tuple[
+        Float[Array, " a_size"],
+        Float[Array, " interpolated"],
+        Float[Array, "n_intervals quad_order"],
+        Float[Array, "interpolated x_size"],
+        Float[Array, "interpolated y_size"],
+        Float[Array, "interpolated y_size"],
+    ],
+]:
+    n = (quad_order + 3) // 2
+    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        "options_adj": options_adj,
+        "mode": mode,
+    }
+    if mode == "reverse":
+        x, y, yp = _reverse_mode(model, params, ts, x0, y0, **kwargs)
+    elif mode in ("reverse_forward", "alternating"):
+        x, y, yp = _forward_mode(model, params, ts, x0, y0, **kwargs)
+    else:
+        raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
+    x1 = x[:: n - 1]
+    y1 = y[:: n - 1]
+    yp1 = yp[:: n - 1]
+    return (x1, y1, yp1), (params, ts, ws, x, y, yp)
 
 
 def _reverse_mode_bwd(
