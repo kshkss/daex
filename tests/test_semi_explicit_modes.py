@@ -200,3 +200,30 @@ def test_mode_derivatives_match_analytic(dae, params, ts, y0, mode, transforms):
 
     expected = _differentiate(loss_acc, transforms, unravel, flat.size)(z)
     assert jnp.allclose(value, expected, 1e-4, 1e-4), (value, expected)
+
+
+@pytest.mark.parametrize("mode", MODE_ORDERS)
+def test_mode_derivatives_ignore_algebraic_initial_value(dae, params, ts, y0, mode):
+    """
+    The algebraic initial value is determined by the constraint, so a
+    derivative whose last direction moves only x0 must vanish, even after
+    differentiating along ts[0] at the lower orders.
+    """
+
+    def loss(z):
+        params, ts, y0 = z
+        u, _ = daeint(params, dae, ts, y0, mode=mode)
+        return u.y[-1]
+
+    z = (params, ts, y0)
+    zeros = jax.tree.map(jnp.zeros_like, z)
+    along_t0 = (zeros[0], zeros[1].at[0].set(1.0), zeros[2])
+    along_x0 = (zeros[0], zeros[1], zeros[2]._replace(x=jnp.ones_like(y0.x)))
+
+    transforms = MODE_ORDERS[mode]
+    f = loss
+    for k, op in enumerate(transforms):
+        direction = along_x0 if k == len(transforms) - 1 else along_t0
+        f = _grad_along(f, direction) if op == "R" else _jvp_along(f, direction)
+    value = f(z)
+    assert jnp.allclose(value, 0.0, 1e-4, 1e-4), value
