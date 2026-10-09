@@ -772,6 +772,36 @@ def _forward_mode(
     return x, y, yp
 
 
+@partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _consistent_x(
+    model: _Model,
+    t: Float[Array, ""],
+    x: Float[Array, " x_size"],
+    y: Float[Array, " y_size"],
+    a: Float[Array, " a_size"],
+) -> Float[Array, " x_size"]:
+    """
+    Return `x`, assumed to satisfy g(t, x, y, a) = 0, differentiated as the
+    implicit function x(t, y, a) instead of as an independent input.
+    """
+    return x
+
+
+@_consistent_x.defjvp
+def _consistent_x_jvp(model: _Model, primals, tangents):
+    t, x, y, a = primals
+    dt, _, dy, da = tangents
+    # Recurse so that higher orders also differentiate x as the implicit function.
+    x = _consistent_x(model, t, x, y, a)
+    if x.size == 0:
+        return x, jnp.zeros_like(x)
+    dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t, x, y, a)
+    _, dg = jax.jvp(
+        lambda t, y, a: _const_fn(model, t, x, y, a), (t, y, a), (dt, dy, da)
+    )
+    return x, -jnp.linalg.solve(dgdx, dg)
+
+
 @_forward_mode.defjvp
 def _forward_mode_jvp(
     model: _Model,
@@ -784,6 +814,9 @@ def _forward_mode_jvp(
 ):
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
+    # The tangent of x0 is ignored since x0 is determined by g = 0. When this
+    # rule is differentiated again, x0 must also follow t0, y0 and params.
+    x0 = _consistent_x(model, ts[0], x0, y0, params)
     yp0 = _deriv_fn(model, ts[0], x0, y0, params)
     z_a = jnp.zeros_like(y0)
     z_y0 = d_y0
@@ -1108,6 +1141,9 @@ def daeint[Params, Var](
       - "alternating": first order reverse, then forward and reverse
         alternately at each higher order.
       Any other value raises ValueError.
+    - xy0 (Var): Initial values. The algebraic variables must satisfy the
+      constraint at ts[0]; their tangents are ignored, since they are
+      determined by the differential variables, ts[0] and params.
     - options (dict): Additional options for the solver.
     """
     if quad_order < 0:
