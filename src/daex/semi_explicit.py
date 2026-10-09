@@ -1,5 +1,5 @@
 import dataclasses
-from typing import Callable, Any, NamedTuple, Protocol, runtime_checkable
+from typing import Callable, Any, Literal, NamedTuple, Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import jax.scipy as jsp
@@ -336,6 +336,9 @@ def _legacy_callbacks(
         da_fn=da_fn,
         _clear_cache=clear_cache,
     )
+
+
+Mode = Literal["forward", "reverse", "reverse_forward", "alternating"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -696,61 +699,7 @@ def _finalize_jvp(deriv_fn, const_fn, params, d_params, t, dt, x, y, yp, *args):
     return (dx, dy, dyp)
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7))
-def _daeint2(
-    model: _Model,
-    params: Float[Array, " a_size"],
-    ts: Float[Array, " points"],
-    x0: Float[Array, " x_size"],
-    y0: Float[Array, " y_size"],
-    quad_order: int,
-    options: dict,
-    options_sdj: dict,
-) -> tuple[
-    Float[Array, " x_size"],
-    Float[Array, " y_size"],
-    Float[Array, " y_size"],
-]:
-    """Perform DAE integration using IDA."""
-    x, y, yp = run_forward(model, params, ts, x0, y0, options)
-    return x, y, yp
-
-
-def _daeint_fwd2(
-    model: _Model,
-    params: Float[Array, " a_size"],
-    ts: Float[Array, " points"],
-    x0: Float[Array, " x_size"],
-    y0: Float[Array, " y_size"],
-    quad_order: int,
-    options: dict,
-    options_sdj: dict,
-) -> tuple[
-    tuple[
-        Float[Array, "points x_size"],
-        Float[Array, "points y_size"],
-        Float[Array, "points y_size"],
-    ],
-    tuple[
-        Float[Array, " a_size"],
-        Float[Array, " interpolated"],
-        Float[Array, "n_intervals quad_order"],
-        Float[Array, "interpolated x_size"],
-        Float[Array, "interpolated y_size"],
-        Float[Array, "interpolated y_size"],
-    ],
-]:
-    n = (quad_order + 3) // 2
-    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
-    x, y, yp = run_forward(model, params, ts, x0, y0, options)
-    x1 = x[:: n - 1]
-    y1 = y[:: n - 1]
-    yp1 = yp[:: n - 1]
-    return (x1, y1, yp1), (params, ts, ws, x, y, yp)
-
-
-@partial(jax.custom_jvp, nondiff_argnums=(0, 5))
-def run_forward(model: _Model, params, ts, x0, y0, options: dict):
+def _run_forward(model: _Model, params, ts, x0, y0, options: dict):
     yp0 = _deriv_fn(model, ts[0], x0, y0, params)
     xy = jnp.append(x0, y0)
     xyp = jnp.append(jnp.zeros_like(x0), yp0)
@@ -806,10 +755,68 @@ def run_forward(model: _Model, params, ts, x0, y0, options: dict):
     return x, y, yp
 
 
-@run_forward.defjvp
-def run_forward_jvp(model: _Model, options: dict, primals, tangents):
+@partial(jax.custom_jvp, nondiff_argnums=(0, 5, 6, 7, 8))
+def _forward_mode(
+    model: _Model,
+    params,
+    ts,
+    x0,
+    y0,
+    options: dict,
+    quad_order: int = 5,
+    options_adj: dict = {},
+    mode: Mode = "forward",
+):
+    """Perform DAE integration using IDA."""
+    x, y, yp = _run_forward(model, params, ts, x0, y0, options)
+    return x, y, yp
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _consistent_x(
+    model: _Model,
+    t: Float[Array, ""],
+    x: Float[Array, " x_size"],
+    y: Float[Array, " y_size"],
+    a: Float[Array, " a_size"],
+) -> Float[Array, " x_size"]:
+    """
+    Return `x`, assumed to satisfy g(t, x, y, a) = 0, differentiated as the
+    implicit function x(t, y, a) instead of as an independent input.
+    """
+    return x
+
+
+@_consistent_x.defjvp
+def _consistent_x_jvp(model: _Model, primals, tangents):
+    t, x, y, a = primals
+    dt, _, dy, da = tangents
+    # Recurse so that higher orders also differentiate x as the implicit function.
+    x = _consistent_x(model, t, x, y, a)
+    if x.size == 0:
+        return x, jnp.zeros_like(x)
+    dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t, x, y, a)
+    _, dg = jax.jvp(
+        lambda t, y, a: _const_fn(model, t, x, y, a), (t, y, a), (dt, dy, da)
+    )
+    return x, -jnp.linalg.solve(dgdx, dg)
+
+
+@_forward_mode.defjvp
+def _forward_mode_jvp(
+    model: _Model,
+    options: dict,
+    quad_order: int,
+    options_adj: dict,
+    mode: Mode,
+    primals,
+    tangents,
+):
     params, ts, x0, y0 = primals
     d_params, d_ts, _, d_y0 = tangents
+    # The tangent of x0 is ignored since x0 is determined by g = 0. When this
+    # rule is differentiated again, x0 must also follow t0, y0 and params.
+    x0 = _consistent_x(model, ts[0], x0, y0, params)
     yp0 = _deriv_fn(model, ts[0], x0, y0, params)
     z_a = jnp.zeros_like(y0)
     z_y0 = d_y0
@@ -818,7 +825,18 @@ def run_forward_jvp(model: _Model, options: dict, primals, tangents):
     ext_model, _x, _y, _a = _make_extended(
         model, x0, y0, z_a, z_y0, z_t0, _ExtendedParams(params, d_params)
     )
-    x, y, yp = run_forward(ext_model, _a, ts, _x, _y, options)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        "options_adj": options_adj,
+        "mode": mode,
+    }
+    if mode in ("forward", "reverse_forward"):
+        x, y, yp = _forward_mode(ext_model, _a, ts, _x, _y, **kwargs)
+    elif mode == "alternating":
+        x, y, yp = _reverse_mode(ext_model, _a, ts, _x, _y, **kwargs)
+    else:
+        raise ValueError(f"Unexpected mode in forward-mode rule: {mode!r}")
     y = y.reshape([ts.size, 4, y0.size])
     yp = yp.reshape([ts.size, 4, y0.size])
 
@@ -838,11 +856,84 @@ def run_forward_jvp(model: _Model, options: dict, primals, tangents):
     return (x, y[:, 0, :], yp[:, 0, :]), (dx, dy, dyp)
 
 
-def _daeint_bwd2(
+@partial(jax.custom_vjp, nondiff_argnums=(0, 5, 6, 7, 8))
+def _reverse_mode(
+    model: _Model,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " points"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+    quad_order: int,
+    options: dict,
+    options_adj: dict,
+    mode: Mode = "reverse",
+) -> tuple[
+    Float[Array, " x_size"],
+    Float[Array, " y_size"],
+    Float[Array, " y_size"],
+]:
+    """Perform DAE integration using IDA."""
+    x, y, yp = _run_forward(model, params, ts, x0, y0, options)
+    return x, y, yp
+
+
+def _reverse_mode_fwd(
+    model: _Model,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " points"],
+    x0: Float[Array, " x_size"],
+    y0: Float[Array, " y_size"],
+    quad_order: int,
+    options: dict,
+    options_adj: dict,
+    mode: Mode = "reverse",
+) -> tuple[
+    tuple[
+        Float[Array, "points x_size"],
+        Float[Array, "points y_size"],
+        Float[Array, "points y_size"],
+    ],
+    tuple[
+        Float[Array, " a_size"],
+        Float[Array, " interpolated"],
+        Float[Array, "n_intervals quad_order"],
+        Float[Array, "interpolated x_size"],
+        Float[Array, "interpolated y_size"],
+        Float[Array, "interpolated y_size"],
+    ],
+]:
+    n = (quad_order + 3) // 2
+    ts, ws = utils.divide_intervals(ts[:-1], ts[1:], n=n)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        "options_adj": options_adj,
+        "mode": mode,
+    }
+    if mode == "reverse":
+        x, y, yp = _reverse_mode(model, params, ts, x0, y0, **kwargs)
+    elif mode in ("reverse_forward", "alternating"):
+        x, y, yp = _forward_mode(model, params, ts, x0, y0, **kwargs)
+    else:
+        raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
+    x1 = x[:: n - 1]
+    y1 = y[:: n - 1]
+    yp1 = yp[:: n - 1]
+    # Do not return an input as-is as a residual. JAX forwards such residuals
+    # from the inputs by index, but the partial evaluation of scan
+    # (JaxprTrace.process_custom_vjp_call) prepends constants to the inputs
+    # without shifting the indices, so the bwd rule receives a wrong value
+    # (seen in third-order reverse mode). `+ 0.0` makes `params` a distinct
+    # value to avoid it.
+    return (x1, y1, yp1), (params + 0.0, ts, ws, x, y, yp)
+
+
+def _reverse_mode_bwd(
     model: _Model,
     quad_order: int,
     options: dict,
     options_adj: dict,
+    mode: Mode,
     residuals: tuple[
         Float[Array, " a_size"],
         Float[Array, " interpolated"],
@@ -894,6 +985,8 @@ def _daeint_bwd2(
                 jax.lax.dynamic_slice_in_dim(y, start, n),
                 jax.lax.dynamic_slice_in_dim(yp, start, n),
                 lam_f1,
+                quad_order=quad_order,
+                mode=mode,
             )
             return lam_f0, dJda - integral
 
@@ -915,7 +1008,7 @@ def _daeint_bwd2(
     return (dJda, dJdt, None, dJdy0)
 
 
-_daeint2.defvjp(_daeint_fwd2, _daeint_bwd2)
+_reverse_mode.defvjp(_reverse_mode_fwd, _reverse_mode_bwd)
 
 
 def _point_multipliers(
@@ -983,6 +1076,8 @@ def _daeint_bwd_step2(
     y: Float[Array, "quad_order y_size"],
     yp: Float[Array, "quad_order y_size"],
     lam_f1: Float[Array, " y_size"],
+    quad_order: int = 5,
+    mode: Mode = "reverse",
 ) -> tuple[Float[Array, " y_size"], Float[Array, " a_size"]]:
     """
     Solve the adjoint DAE backward over one interval [ts[0], ts[-1]] from
@@ -1000,7 +1095,18 @@ def _daeint_bwd_step2(
     lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
 
     adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
-    _x, _y, _yp = run_forward(adj_model, _a, ts[::-1], _x, _y, options)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        "options_adj": options,
+        "mode": mode,
+    }
+    if mode == "reverse":
+        _x, _y, _yp = _reverse_mode(adj_model, _a, ts[::-1], _x, _y, **kwargs)
+    elif mode in ("reverse_forward", "alternating"):
+        _x, _y, _yp = _forward_mode(adj_model, _a, ts[::-1], _x, _y, **kwargs)
+    else:
+        raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
 
     xy = jax.vmap(
         lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
@@ -1019,6 +1125,7 @@ def daeint[Params, Var](
     ts: Float[Array, " _"],
     xy0: Var,
     *,
+    mode: Mode = "reverse",
     quad_order=5,
     options: dict = {},
     options_adj: dict = {},
@@ -1027,6 +1134,16 @@ def daeint[Params, Var](
     Interface of SUNDIALS IDA solver for systems defined as
 
     Args:
+    - mode (str): Differentiation mode. Default is "reverse".
+      - "forward": every order of differentiation uses forward-mode rules.
+      - "reverse": every order of differentiation uses reverse-mode rules.
+      - "reverse_forward": first order reverse, higher orders forward.
+      - "alternating": first order reverse, then forward and reverse
+        alternately at each higher order.
+      Any other value raises ValueError.
+    - xy0 (Var): Initial values. The algebraic variables must satisfy the
+      constraint at ts[0]; their tangents are ignored, since they are
+      determined by the differential variables, ts[0] and params.
     - options (dict): Additional options for the solver.
     """
     if quad_order < 0:
@@ -1039,7 +1156,18 @@ def daeint[Params, Var](
     unravel_x = model.unravel_x
     unravel_y = model.unravel_y
 
-    x, y, yp = _daeint2(model, a, ts, x, y, quad_order, options, options_adj)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        "options_adj": options_adj,
+        "mode": mode,
+    }
+    if mode == "forward":
+        x, y, yp = _forward_mode(model, a, ts, x, y, **kwargs)
+    elif mode in ("reverse", "reverse_forward", "alternating"):
+        x, y, yp = _reverse_mode(model, a, ts, x, y, **kwargs)
+    else:
+        raise ValueError(f"Unknown mode: {mode!r}")
 
     with jax.profiler.TraceAnnotation("daeint:calc_dxdt"):
 
@@ -1216,7 +1344,7 @@ def adjoint[Params, Var](
         lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
 
         adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
-        _x, _y, _ = run_forward(adj_model, _a, interval_ts[::-1], _x, _y, options)
+        _x, _y, _ = _forward_mode(adj_model, _a, interval_ts[::-1], _x, _y, options)
         xy = jax.vmap(
             lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
         )(_x[::-1], _y[::-1])
