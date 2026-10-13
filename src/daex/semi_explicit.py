@@ -777,8 +777,11 @@ def _forward_mode(
     `quad_order`, `options_adj` and `mode` are not used here; they are only
     passed on to the rule of the next order.
     """
-    x, y, yp = _run_forward(model, params, ts, x0, y0, options)
-    return x, y, yp
+    if mode in ("forward", "reverse_forward", "alternating"):
+        x, y, yp = _run_forward(model, params, ts, x0, y0, options)
+        return x, y, yp
+    else:
+        raise ValueError(f"Unexpected mode in forward-mode rule: {mode!r}")
 
 
 @partial(jax.custom_jvp, nondiff_argnums=(0,))
@@ -891,8 +894,11 @@ def _reverse_mode(
     `_reverse_mode` for mode "reverse", or by `_forward_mode` for
     "reverse_forward" / "alternating".
     """
-    x, y, yp = _run_forward(model, params, ts, x0, y0, options)
-    return x, y, yp
+    if mode in ("reverse", "reverse_forward", "alternating"):
+        x, y, yp = _run_forward(model, params, ts, x0, y0, options)
+        return x, y, yp
+    else:
+        raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
 
 
 def _reverse_mode_fwd(
