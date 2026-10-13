@@ -40,7 +40,17 @@ def problem(request):
 
     def forward(a, ts, y):
         # x0 = sqrt(y0) keeps the initial condition consistent with constraint.
-        return _forward_mode(model, a, ts, jnp.sqrt(y), y, {})
+        return _forward_mode(
+            model,
+            a,
+            ts,
+            jnp.sqrt(y),
+            y,
+            {},
+            quad_order=5,
+            options_adj={},
+            mode="forward",
+        )
 
     return forward, a, ts, y
 
