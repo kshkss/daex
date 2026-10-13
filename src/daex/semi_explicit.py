@@ -767,7 +767,16 @@ def _forward_mode(
     options_adj: dict,
     mode: Mode,
 ):
-    """Perform DAE integration using IDA."""
+    """
+    Perform DAE integration using IDA, differentiated by a forward-mode
+    (custom_jvp) rule.
+
+    The JVP rule integrates the DAE extended with its tangents. That
+    integration is differentiated again by `_forward_mode` for mode
+    "forward" / "reverse_forward", or by `_reverse_mode` for "alternating".
+    `quad_order`, `options_adj` and `mode` are not used here; they are only
+    passed on to the rule of the next order.
+    """
     x, y, yp = _run_forward(model, params, ts, x0, y0, options)
     return x, y, yp
 
@@ -872,7 +881,16 @@ def _reverse_mode(
     Float[Array, " y_size"],
     Float[Array, " y_size"],
 ]:
-    """Perform DAE integration using IDA."""
+    """
+    Perform DAE integration using IDA, differentiated by a reverse-mode
+    (custom_vjp) rule.
+
+    The VJP rule solves the adjoint DAE backward over each interval with
+    `options_adj` and integrates it with a quadrature of order `quad_order`.
+    The integrations inside the rule are differentiated again by
+    `_reverse_mode` for mode "reverse", or by `_forward_mode` for
+    "reverse_forward" / "alternating".
+    """
     x, y, yp = _run_forward(model, params, ts, x0, y0, options)
     return x, y, yp
 
@@ -924,7 +942,9 @@ def _reverse_mode_fwd(
     # (JaxprTrace.process_custom_vjp_call) prepends constants to the inputs
     # without shifting the indices, so the bwd rule receives a wrong value
     # (seen in third-order reverse mode). `+ 0.0` makes `params` a distinct
-    # value to avoid it.
+    # value to avoid it. Regression test:
+    # test_mode_derivatives_match_analytic[reverse-RRR] in
+    # tests/test_semi_explicit_modes.py.
     return (x1, y1, yp1), (params + 0.0, ts, ws, x, y, yp)
 
 
