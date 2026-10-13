@@ -763,9 +763,9 @@ def _forward_mode(
     x0,
     y0,
     options: dict,
-    quad_order: int = 5,
-    options_adj: dict = {},
-    mode: Mode = "forward",
+    quad_order: int,
+    options_adj: dict,
+    mode: Mode,
 ):
     """Perform DAE integration using IDA."""
     x, y, yp = _run_forward(model, params, ts, x0, y0, options)
@@ -866,7 +866,7 @@ def _reverse_mode(
     quad_order: int,
     options: dict,
     options_adj: dict,
-    mode: Mode = "reverse",
+    mode: Mode,
 ) -> tuple[
     Float[Array, " x_size"],
     Float[Array, " y_size"],
@@ -886,7 +886,7 @@ def _reverse_mode_fwd(
     quad_order: int,
     options: dict,
     options_adj: dict,
-    mode: Mode = "reverse",
+    mode: Mode,
 ) -> tuple[
     tuple[
         Float[Array, "points x_size"],
@@ -1076,8 +1076,8 @@ def _daeint_bwd_step2(
     y: Float[Array, "quad_order y_size"],
     yp: Float[Array, "quad_order y_size"],
     lam_f1: Float[Array, " y_size"],
-    quad_order: int = 5,
-    mode: Mode = "reverse",
+    quad_order: int,
+    mode: Mode,
 ) -> tuple[Float[Array, " y_size"], Float[Array, " a_size"]]:
     """
     Solve the adjoint DAE backward over one interval [ts[0], ts[-1]] from
@@ -1098,6 +1098,8 @@ def _daeint_bwd_step2(
     kwargs = {
         "quad_order": quad_order,
         "options": options,
+        # The caller passes options_adj as `options`, so the adjoint DAEs of
+        # higher orders are also solved with options_adj.
         "options_adj": options,
         "mode": mode,
     }
@@ -1344,7 +1346,17 @@ def adjoint[Params, Var](
         lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
 
         adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
-        _x, _y, _ = _forward_mode(adj_model, _a, interval_ts[::-1], _x, _y, options)
+        _x, _y, _ = _forward_mode(
+            adj_model,
+            _a,
+            interval_ts[::-1],
+            _x,
+            _y,
+            options,
+            quad_order=5,
+            options_adj={},
+            mode="forward",
+        )
         xy = jax.vmap(
             lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
         )(_x[::-1], _y[::-1])
