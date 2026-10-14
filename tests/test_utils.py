@@ -26,3 +26,10 @@ def test_hermite_spline_descending_points_match_ascending():
     desc = HermiteSpline(points[::-1], f(points[::-1]), df(points[::-1]))
     ts = jnp.linspace(points[0], points[-1], 17)
     assert jnp.allclose(jax.vmap(desc)(ts), jax.vmap(asc)(ts), 0.0, 1e-14)
+
+
+def test_hermite_spline_equal_endpoints_search_as_ascending():
+    points = jnp.array([1.0, 1.0, 1.0])
+    spline = HermiteSpline(points, f(points), df(points))
+    assert spline._find_segment(jnp.array(2.0)) == len(points) - 2
+    assert spline._find_segment(jnp.array(0.0)) == 0
