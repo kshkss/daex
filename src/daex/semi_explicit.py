@@ -1103,61 +1103,6 @@ def _point_vjp(
     return dJdy, dJdt, dJda
 
 
-def _daeint_bwd_step2(
-    model: _Model,
-    options: dict,
-    params: Float[Array, " a_size"],
-    ts: Float[Array, " quad_order"],
-    ws: Float[Array, " quad_order"],
-    x: Float[Array, "quad_order x_size"],
-    y: Float[Array, "quad_order y_size"],
-    yp: Float[Array, "quad_order y_size"],
-    lam_f1: Float[Array, " y_size"],
-    quad_order: int,
-    mode: Mode,
-) -> tuple[Float[Array, " y_size"], Float[Array, " a_size"]]:
-    """
-    Solve the adjoint DAE backward over one interval [ts[0], ts[-1]] from
-    lambda_f(ts[-1]) = lam_f1, and return lambda_f(ts[0]) and the integral of
-    lambda_f^T dfda - lambda_g^T dgda over the interval.
-    """
-    yfunc = HermiteSpline(ts, y, yp)
-    adj_params = _AdjointParams(params, yfunc)
-
-    t1 = ts[-1]
-    x1 = x[-1]
-    y1 = y[-1]
-    _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t1, x1, y1, params)
-    dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t1, x1, y1, params)
-    lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
-
-    adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
-    kwargs = {
-        "quad_order": quad_order,
-        "options": options,
-        # The caller passes options_adj as `options`, so the adjoint DAEs of
-        # higher orders are also solved with options_adj.
-        "options_adj": options,
-        "mode": mode,
-    }
-    if mode == "reverse":
-        _x, _y, _yp = _reverse_mode(adj_model, _a, ts[::-1], _x, _y, **kwargs)
-    elif mode in ("reverse_forward", "alternating"):
-        _x, _y, _yp = _forward_mode(adj_model, _a, ts[::-1], _x, _y, **kwargs)
-    else:
-        raise ValueError(f"Unexpected mode in reverse-mode rule: {mode!r}")
-
-    xy = jax.vmap(
-        lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
-    )(_x[::-1], _y[::-1])
-
-    with jax.profiler.TraceAnnotation("daeint:integrate_da"):
-        integrand = jax.vmap(adj_model.da, in_axes=(None, 0, 0))(adj_params, ts, xy)
-        integral = jnp.dot(ws, integrand)
-
-    return xy.lam_f[0], integral
-
-
 def _bwd_int(
     model: _Model,
     options: dict,
