@@ -1147,6 +1147,57 @@ def _daeint_bwd_step2(
     return xy.lam_f[0], integral
 
 
+def _bwd_int(
+    model: _Model,
+    options: dict,
+    params: Float[Array, " a_size"],
+    ts: Float[Array, " n"],
+    x: Float[Array, "n x_size"],
+    y: Float[Array, "n y_size"],
+    yp: Float[Array, "n y_size"],
+    lam_f1: Float[Array, " y_size"],
+    quad_order: int,
+    mode: Mode,
+) -> _AdjointState:
+    """
+    Solve the adjoint DAE backward over [ts[0], ts[-1]], an interval on which
+    lambda_f is continuous, from lambda_f(ts[-1]) = lam_f1.
+
+    `ts` holds both ends of the interval and the checkpoints inside it in
+    ascending order, and x, y, yp are the forward solution at `ts`. lam_f1
+    must already include the jump at ts[-1]. Returns the adjoint state
+    (x, lambda_g, lambda_f) at every point of `ts`, in ascending order.
+    """
+    yfunc = HermiteSpline(ts, y, yp)
+    adj_params = _AdjointParams(params, yfunc)
+
+    t1 = ts[-1]
+    x1 = x[-1]
+    y1 = y[-1]
+    _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t1, x1, y1, params)
+    dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t1, x1, y1, params)
+    lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
+
+    adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
+    kwargs = {
+        "quad_order": quad_order,
+        "options": options,
+        # The adjoint DAEs of higher orders are also solved with `options`.
+        "options_adj": options,
+        "mode": mode,
+    }
+    if mode == "reverse":
+        _x, _y, _yp = _reverse_mode(adj_model, _a, ts[::-1], _x, _y, **kwargs)
+    elif mode in ("forward", "reverse_forward", "alternating"):
+        _x, _y, _yp = _forward_mode(adj_model, _a, ts[::-1], _x, _y, **kwargs)
+    else:
+        raise ValueError(f"Unexpected mode in backward integration: {mode!r}")
+
+    return jax.vmap(
+        lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
+    )(_x[::-1], _y[::-1])
+
+
 def daeint[Params, Var](
     params: Params,
     dae: SemiExplicitDAE,
