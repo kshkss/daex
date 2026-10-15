@@ -1153,7 +1153,7 @@ def daeint[Params, Var](
     ts: Float[Array, " _"],
     xy0: Var,
     *,
-    mode: Mode = "reverse",
+    mode: Mode = "reverse_forward",
     quad_order=5,
     options: dict = {},
     options_adj: dict = {},
