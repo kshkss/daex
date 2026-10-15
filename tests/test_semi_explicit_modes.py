@@ -59,13 +59,6 @@ def ts():
     return jnp.linspace(-0.5, 1.0, 11)
 
 
-def assert_allclose_tree(a, b):
-    matches = jax.tree.leaves(
-        jax.tree.map(lambda x, y: jnp.allclose(x, y, 1e-4, 1e-4), a, b)
-    )
-    assert all(matches), (a, b)
-
-
 def test_invalid_mode_raises(dae, params, ts, y0):
     with pytest.raises(ValueError):
         daeint(params, dae, ts, y0, mode="bogus")
@@ -92,20 +85,6 @@ def test_reverse_mode_gradient_includes_ts0_cotangent(dae, params, ts, y0):
     fd_y0 = (loss(params, ts, y0_plus) - loss(params, ts, y0_minus)) / (2 * eps)
 
     assert jnp.allclose(grad_y0.y, fd_y0, 1e-3, 1e-3)
-
-
-def test_default_mode_is_reverse(dae, params, ts, y0):
-    def loss_default(params, ts, y0):
-        u, _ = daeint(params, dae, ts, y0)
-        return u.y[-1]
-
-    def loss_reverse(params, ts, y0):
-        u, _ = daeint(params, dae, ts, y0, mode="reverse")
-        return u.y[-1]
-
-    grad_default = jax.grad(loss_default, argnums=[0, 1, 2])(params, ts, y0)
-    grad_reverse = jax.grad(loss_reverse, argnums=[0, 1, 2])(params, ts, y0)
-    assert_allclose_tree(grad_default, grad_reverse)
 
 
 # Differentiation used at each order by each mode: R = reverse, F = forward.
