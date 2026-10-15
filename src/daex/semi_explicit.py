@@ -994,6 +994,12 @@ def _reverse_mode_bwd(
         partial(_point_multipliers, model), in_axes=(None, 0, 0, 0, 0, 0, 0)
     )(params, tk, xk, yk, wx, wy, wyp)
 
+    def integrand(t, x, y, lam_g, lam_f):
+        # lambda_f^T dfda - lambda_g^T dgda
+        _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t, x, y, params)
+        _, vjp_const = jax.vjp(partial(_const_fn, model), t, x, y, params)
+        return vjp_deriv(lam_f)[3] - vjp_const(lam_g)[3]
+
     def body(j, carry):
         k = points - 1 - j
         with jax.profiler.StepTraceAnnotation("daeint:backward_step", step_num=j):
@@ -1001,20 +1007,25 @@ def _reverse_mode_bwd(
             # Jump condition: lambda_{f,k}(t_k) = mu_{y_k} + lambda_{f,k+1}(t_k)
             lam_f1 = mu_y[k] + lam_next
             start = (k - 1) * (n - 1)
-            lam_f0, integral = _daeint_bwd_step2(
+            ts_k = jax.lax.dynamic_slice_in_dim(ts, start, n)
+            y_k = jax.lax.dynamic_slice_in_dim(y, start, n)
+            xy = _bwd_int(
                 model,
                 options_adj,
                 params,
-                jax.lax.dynamic_slice_in_dim(ts, start, n),
-                ws[k - 1],
+                ts_k,
                 jax.lax.dynamic_slice_in_dim(x, start, n),
-                jax.lax.dynamic_slice_in_dim(y, start, n),
+                y_k,
                 jax.lax.dynamic_slice_in_dim(yp, start, n),
                 lam_f1,
                 quad_order=quad_order,
                 mode=mode,
             )
-            return lam_f0, dJda - integral
+            with jax.profiler.TraceAnnotation("daeint:integrate_da"):
+                integral = jnp.dot(
+                    ws[k - 1], jax.vmap(integrand)(ts_k, xy.x, y_k, xy.lam_g, xy.lam_f)
+                )
+            return xy.lam_f[0], dJda - integral
 
     # lambda_{f,K+1}(t_K) = 0
     lam_f_t0, dJda = jax.lax.fori_loop(
