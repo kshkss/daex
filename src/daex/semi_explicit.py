@@ -1253,6 +1253,8 @@ def adjoint[Params, Var](
     solution: Results[Var],
     cotangent: Results[Var],
     *,
+    mode: Mode = "forward",
+    quad_order=5,
     options: dict = {},
 ) -> AdjointResult[Var]:
     """
@@ -1323,9 +1325,20 @@ def adjoint[Params, Var](
     - ts (Array): Coordinates at which `solution`/`cotangent` are sampled.
     - solution (Results[Var]): The forward solution.
     - cotangent (Results[Var]): Cotangent matching `solution`.
+    - mode (str): Differentiation mode used when the result of `adjoint` is
+      differentiated, with the same meaning as in `daeint`. Default is
+      "forward". It does not affect the computation of `adjoint` itself.
+    - quad_order (int): Order of the quadrature used when the result of
+      `adjoint` is differentiated by a reverse-mode rule. Must be a positive
+      odd integer. It does not affect the computation of `adjoint` itself.
     - options (dict): Additional options for the backward IDA solver,
       passed through to the adjoint DAE integration.
     """
+    if quad_order < 0:
+        raise NotImplementedError("quad_order must be positive.")
+    if quad_order % 2 == 0:
+        raise NotImplementedError("quad_order must be odd.")
+
     solution_values, solution_derivative = solution
     cotangent_values, cotangent_derivative = cotangent
 
@@ -1373,8 +1386,8 @@ def adjoint[Params, Var](
             jax.lax.dynamic_slice_in_dim(y, k, 2),
             jax.lax.dynamic_slice_in_dim(yp, k, 2),
             lam_f1,
-            quad_order=5,
-            mode="forward",
+            quad_order=quad_order,
+            mode=mode,
         )
         lam_g = lam_g.at[k].set(xy.lam_g)
         lam_f = lam_f.at[k].set(xy.lam_f)
