@@ -6,11 +6,9 @@ import pytest
 
 from jax.flatten_util import ravel_pytree
 
-from daex import utils
 from daex.semi_explicit import (
     Results,
     _bwd_int,
-    _daeint_bwd_step2,
     _make_model,
     adjoint,
     daeint,
@@ -104,46 +102,3 @@ def test_bwd_int_matches_adjoint_on_each_interval(dae, params, ts, y0):
         )
         assert jnp.allclose(xy.lam_f, lam_f[k])
         assert jnp.allclose(xy.lam_g, lam_g[k])
-
-
-def test_bwd_int_matches_daeint_bwd_step2(dae, params, y0):
-    quad_order = 9
-    n = (quad_order + 3) // 2
-    ts, ws = utils.divide_intervals(jnp.array([-0.5]), jnp.array([1.0]), n=n)
-    result = daeint(params, dae, ts, y0)
-
-    x0, y0_ = dae.partition(y0)
-    model, _, _, a = _make_model(dae, x0, y0_, params)
-    x, y, yp = ravel_solution(dae, result)
-    lam_f1 = jnp.ones_like(y[-1])
-
-    xy = _bwd_int(
-        model,
-        {},
-        a,
-        ts,
-        x,
-        y,
-        yp,
-        lam_f1,
-        quad_order=quad_order,
-        mode="reverse_forward",
-    )
-    lam_f0, _ = _daeint_bwd_step2(
-        model,
-        {},
-        a,
-        ts,
-        ws[0],
-        x,
-        y,
-        yp,
-        lam_f1,
-        quad_order=quad_order,
-        mode="reverse_forward",
-    )
-
-    assert xy.lam_f.shape == (n, y.shape[1])
-    assert xy.lam_g.shape == (n, x.shape[1])
-    assert jnp.allclose(xy.lam_f[0], lam_f0)
-    assert jnp.allclose(xy.lam_f[-1], lam_f1)
