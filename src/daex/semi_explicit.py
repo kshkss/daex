@@ -1403,62 +1403,42 @@ def adjoint[Params, Var](
     _, wyp = jax.vmap(ravel_xy)(cotangent_derivative)
 
     points = ts.shape[0]
-    ts_r = ts[::-1]
-    x_r = x[::-1]
-    y_r = y[::-1]
-    yp_r = yp[::-1]
 
     # Point multipliers mu_f, mu_g, mu_y at every ts[k].
     mu_f, mu_g, mu_y = jax.vmap(
         partial(_point_multipliers, model), in_axes=(None, 0, 0, 0, 0, 0, 0)
     )(a, ts, x, y, wx, wy, wyp)
-    mu_y_r = mu_y[::-1]
 
-    # lam_f_r[j] / lam_g_r[j] hold the values at both ends of the j-th
-    # interval counted from the end, i.e. [ts[k], ts[k+1]] with k = points-2-j.
-    lam_f_r = jnp.zeros((points - 1, 2, y.shape[1]), dtype=y.dtype)
-    lam_g_r = jnp.zeros((points - 1, 2, x.shape[1]), dtype=x.dtype)
+    # lam_f[k] / lam_g[k] hold the values at both ends of the interval
+    # [ts[k], ts[k+1]], i.e. (ts[k]+, ts[k+1]-).
+    lam_f = jnp.zeros((points - 1, 2, y.shape[1]), dtype=y.dtype)
+    lam_g = jnp.zeros((points - 1, 2, x.shape[1]), dtype=x.dtype)
 
-    def body(i, carry):
-        lam_next, lam_g_r, lam_f_r = carry
-        interval_ts = jnp.stack([ts_r[i], ts_r[i - 1]])
-        interval_y = jnp.stack([y_r[i], y_r[i - 1]])
-        interval_yp = jnp.stack([yp_r[i], yp_r[i - 1]])
-        yfunc = HermiteSpline(interval_ts, interval_y, interval_yp)
-        adj_params = _AdjointParams(a, yfunc)
-        # Jump condition: lambda_f(ts[k]-) = mu_y at ts[k] + lambda_f(ts[k]+)
-        lam_f1 = mu_y_r[i - 1] + lam_next
-        t1, x1, y1 = ts_r[i - 1], x_r[i - 1], y_r[i - 1]
-        _, vjp_deriv = jax.vjp(partial(_deriv_fn, model), t1, x1, y1, a)
-        dgdx = jax.jacfwd(_const_fn, argnums=2)(model, t1, x1, y1, a)
-        lam_g1 = jnp.linalg.solve(dgdx.T, vjp_deriv(lam_f1)[1])
-
-        adj_model, _x, _y, _a = _make_adjoint(model, x1, lam_g1, lam_f1, adj_params)
-        _x, _y, _ = _forward_mode(
-            adj_model,
-            _a,
-            interval_ts[::-1],
-            _x,
-            _y,
+    def body(j, carry):
+        k = points - 2 - j
+        lam_next, lam_g, lam_f = carry
+        # Jump condition: lambda_f(ts[k+1]-) = mu_y at ts[k+1] + lambda_f(ts[k+1]+)
+        lam_f1 = mu_y[k + 1] + lam_next
+        xy = _bwd_int(
+            model,
             options,
+            a,
+            jax.lax.dynamic_slice_in_dim(ts, k, 2),
+            jax.lax.dynamic_slice_in_dim(x, k, 2),
+            jax.lax.dynamic_slice_in_dim(y, k, 2),
+            jax.lax.dynamic_slice_in_dim(yp, k, 2),
+            lam_f1,
             quad_order=5,
-            options_adj={},
             mode="forward",
         )
-        xy = jax.vmap(
-            lambda _x, _y: eqx.combine(adj_model.unravel_x(_x), adj_model.unravel_y(_y))
-        )(_x[::-1], _y[::-1])
-
-        lam_g_r = lam_g_r.at[i - 1].set(xy.lam_g)
-        lam_f_r = lam_f_r.at[i - 1].set(xy.lam_f)
-        return xy.lam_f[0], lam_g_r, lam_f_r
+        lam_g = lam_g.at[k].set(xy.lam_g)
+        lam_f = lam_f.at[k].set(xy.lam_f)
+        return xy.lam_f[0], lam_g, lam_f
 
     # lambda_{f,K+1}(ts[-1]) = 0
-    _, lam_g_r, lam_f_r = jax.lax.fori_loop(
-        1, points, body, (jnp.zeros_like(wy[0]), lam_g_r, lam_f_r)
+    _, lam_g, lam_f = jax.lax.fori_loop(
+        0, points - 1, body, (jnp.zeros_like(wy[0]), lam_g, lam_f)
     )
-    lam_g = lam_g_r[::-1]  # lam_g[k] = lambda_g at (ts[k]+, ts[k+1]-)
-    lam_f = lam_f_r[::-1]  # lam_f[k] = lambda_f at (ts[k]+, ts[k+1]-)
 
     # mu_{y_0} = -lambda_{f,1}(ts[0])
     mu_y0 = -lam_f[0, 0]
