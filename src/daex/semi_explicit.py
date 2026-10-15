@@ -1169,7 +1169,7 @@ def daeint[Params, Var](
     Interface of SUNDIALS IDA solver for systems defined as
 
     Args:
-    - mode (str): Differentiation mode. Default is "reverse".
+    - mode (str): Differentiation mode. Default is "reverse_forward".
       - "forward": every order of differentiation uses forward-mode rules.
       - "reverse": every order of differentiation uses reverse-mode rules.
       - "reverse_forward": first order reverse, higher orders forward.
