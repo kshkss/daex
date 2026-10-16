@@ -256,3 +256,12 @@ def test_adjoint_matches_finite_difference_with_interior_cotangent(dae, params, 
     assert jnp.allclose(actual_mu(mu_pre_5), expected_mu(lam_pre_5))
     assert jnp.allclose(actual_mu(mu_post_5), expected_mu(lam_post_5))
     assert not jnp.allclose(actual_mu(mu_pre_5), actual_mu(mu_post_5))
+
+
+@pytest.mark.parametrize("quad_order", [-1, 4])
+def test_adjoint_rejects_invalid_quad_order(dae, params, ts, y0, quad_order):
+    result = daeint(params, dae, ts, y0, **DAEINT_OPTIONS)
+    cotangent = jax.tree.map(jnp.zeros_like, result)
+
+    with pytest.raises(NotImplementedError):
+        adjoint(params, dae, ts, result, cotangent, quad_order=quad_order)

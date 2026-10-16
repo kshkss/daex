@@ -119,7 +119,12 @@ class HermiteSpline(eqx.Module):
     derivatives: Any
 
     def _find_segment(self, xi):
-        idx = jnp.searchsorted(self.points, xi) - 1
+        # points may be descending, e.g. for adjoint solutions integrated
+        # backward in time.
+        sign = jnp.sign(self.points[-1] - self.points[0])
+        # Treat equal endpoints as ascending so that xi is not mapped to a constant.
+        sign = jnp.where(sign == 0, 1, sign)
+        idx = jnp.searchsorted(sign * self.points, sign * xi) - 1
         idx = jnp.clip(idx, 0, len(self.points) - 2)
         return idx
 
